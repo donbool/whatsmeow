@@ -183,6 +183,18 @@ func IsLoggedIn() bool {
 	return client != nil && client.Store != nil && client.Store.ID != nil
 }
 
+// OwnJID returns this device's own canonical WhatsApp JID (assigned at pairing), or "" when
+// not paired. It's the authenticated anchor the host uses to attribute the owner's messages.
+func OwnJID() string {
+	mu.Lock()
+	c, ctx := client, rootCtx
+	mu.Unlock()
+	if c == nil || c.Store == nil || c.Store.ID == nil {
+		return ""
+	}
+	return canonicalJID(ctx, c, *c.Store.ID).String()
+}
+
 // IsConnected reports whether the websocket is currently connected. This is
 // independent of login state (an unpaired client can be connected while it
 // waits to be linked).
@@ -562,7 +574,6 @@ type waMessage struct {
 	TimestampSecs int64  `json:"timestampSecs"`
 	Text          string `json:"text"`
 	PushName      string `json:"pushName"`
-	FromMe        bool   `json:"fromMe"`
 	// Dialable phone (digits only, no +) resolved from each JID's LID->PN
 	// mapping; empty when the device knows no phone for that identity.
 	SenderPhoneNumber string `json:"senderPhoneNumber"`
@@ -572,11 +583,25 @@ type waMessage struct {
 }
 
 type historySyncPayload struct {
-	Messages   []waMessage `json:"messages"`
-	SyncType   string      `json:"syncType"`
-	ChunkOrder uint32      `json:"chunkOrder"`
-	Progress   uint32      `json:"progress"`
-	BatchIndex uint32      `json:"batchIndex"`
+	Messages []waMessage `json:"messages"`
+	// PushNames carries counterparty display names from a PUSH_NAME history-sync
+	// event. That event has no messages, so the names are delivered to the host
+	// here (keyed by JID) and applied out-of-band rather than riding on a message.
+	PushNames  []waPushName `json:"pushNames,omitempty"`
+	SyncType   string       `json:"syncType"`
+	ChunkOrder uint32       `json:"chunkOrder"`
+	Progress   uint32       `json:"progress"`
+	BatchIndex uint32       `json:"batchIndex"`
+}
+
+// waPushName is a counterparty's WhatsApp display name (pushName) delivered in a
+// PUSH_NAME history-sync event. JID is canonical (matches a message's SenderJID)
+// so the host/backend can tie it to an existing thread; PhoneNumber is the
+// dialable phone (digits only, no +) for that JID when the device knows it.
+type waPushName struct {
+	JID         string `json:"jid"`
+	Name        string `json:"name"`
+	PhoneNumber string `json:"phoneNumber"`
 }
 
 // messageText pulls plain text out of a message, covering both simple
@@ -614,7 +639,6 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		TimestampSecs:     m.Info.Timestamp.Unix(),
 		Text:              text,
 		PushName:          m.Info.PushName,
-		FromMe:            m.Info.IsFromMe,
 		SenderPhoneNumber: dialablePhone(ctx, c, m.Info.Sender),
 		ChatPhoneNumber:   dialablePhone(ctx, c, m.Info.Chat),
 		ContactName:       deviceContactName(ctx, c, m.Info.Chat),
@@ -754,9 +778,10 @@ func resolveSendJID(ctx context.Context, c *whatsmeow.Client, recipient string) 
 // emitSentMessage echoes a message we just sent through the same OnMessage path
 // used for received messages. whatsmeow does not deliver our own client's sends
 // back as events, so this is the only way our outbound messages reach the host
-// (and thus the chat). It marks FromMe so the host treats it as the owner's
-// message, and carries the server-assigned id+timestamp so a later history-sync
-// copy dedupes against it instead of duplicating.
+// (and thus the chat). SenderJID is our own canonical JID (the same value OwnJID
+// returns), so the host attributes it to the owner; it also carries the
+// server-assigned id+timestamp so a later history-sync copy dedupes against it
+// instead of duplicating.
 func emitSentMessage(ctx context.Context, c *whatsmeow.Client, chat types.JID, id string, text string, ts time.Time) {
 	evt := getEvt()
 	if evt == nil || c.Store == nil || c.Store.ID == nil {
@@ -772,7 +797,6 @@ func emitSentMessage(ctx context.Context, c *whatsmeow.Client, chat types.JID, i
 		TimestampSecs:     ts.Unix(),
 		Text:              text,
 		PushName:          c.Store.PushName,
-		FromMe:            true,
 		SenderPhoneNumber: dialablePhone(ctx, c, *c.Store.ID),
 		ChatPhoneNumber:   dialablePhone(ctx, c, chat),
 		ContactName:       deviceContactName(ctx, c, chat),
@@ -819,6 +843,38 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 	syncType := e.Data.GetSyncType().String()
 	chunkOrder := e.Data.GetChunkOrder()
 	progress := e.Data.GetProgress()
+	// WhatsApp ships counterparty display names (pushNames) in a dedicated
+	// PUSH_NAME history-sync event — a payload that carries NO messages, keyed by
+	// JID. Since the LID/privacy migration the per-message PushName is left blank
+	// for history, so this event is the only place these names arrive. We build
+	// two views of it: a JID->name map to fill any message in *this same* event
+	// that happens to lack a name, and a slice we emit to the host out-of-band
+	// below. The out-of-band emit is the important one: message-bearing events and
+	// the PUSH_NAME event are separate, so without it the names would be dropped
+	// entirely (the host skips empty-message history batches). Key by the same
+	// canonical JID we emit as SenderJID so the backend can match a thread.
+	pushnameByJID := make(map[string]string)
+	pushNames := make([]waPushName, 0, len(e.Data.GetPushnames()))
+	for _, pn := range e.Data.GetPushnames() {
+		name := strings.TrimSpace(pn.GetPushname())
+		if name == "" {
+			continue
+		}
+		jid, err := types.ParseJID(pn.GetID())
+		if err != nil {
+			continue
+		}
+		canonical := canonicalJID(ctx, c, jid).String()
+		if _, seen := pushnameByJID[canonical]; seen {
+			continue
+		}
+		pushnameByJID[canonical] = name
+		pushNames = append(pushNames, waPushName{
+			JID:         canonical,
+			Name:        name,
+			PhoneNumber: dialablePhone(ctx, c, jid),
+		})
+	}
 	batchIndex := uint32(0)
 	batch := make([]waMessage, 0, historyBridgeBatchSize)
 	emitBatch := func() {
@@ -841,6 +897,31 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 		batch = make([]waMessage, 0, historyBridgeBatchSize)
 	}
 
+	// Deliver counterparty names first, in their own payload. WhatsApp sends them
+	// in a messages-less PUSH_NAME event, so this is normally the only thing that
+	// event produces; emitting it lets the backend upgrade a thread still labeled
+	// by phone number on the very first sync. The log line confirms WhatsApp
+	// actually handed us names for these (LID) contacts.
+	if len(pushNames) > 0 {
+		c.Log.Infof("history sync: emitting %d counterparty pushnames (syncType=%s)", len(pushNames), syncType)
+		payload, err := json.Marshal(historySyncPayload{
+			// Empty (not nil) so the host always sees a messages array on a
+			// names-only batch, keeping the bridge payload shape consistent.
+			Messages:   []waMessage{},
+			PushNames:  pushNames,
+			SyncType:   syncType,
+			ChunkOrder: chunkOrder,
+			Progress:   progress,
+			BatchIndex: batchIndex,
+		})
+		if err != nil {
+			evt.OnError("encode_history_pushnames", err.Error())
+		} else {
+			evt.OnHistorySync(string(payload))
+			batchIndex++
+		}
+	}
+
 	for _, conv := range e.Data.GetConversations() {
 		for _, histMsg := range conv.GetMessages() {
 			// Empty chat JID lets ParseWebMessage derive it from the message key.
@@ -849,6 +930,14 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 				continue
 			}
 			if msg, ok := toWaMessage(ctx, c, parsed); ok {
+				// History messages arrive with an empty PushName; fill it from the
+				// blob-level pushnames list so the counterparty is named from the
+				// first sync rather than only once they next message live.
+				if msg.PushName == "" {
+					if name, found := pushnameByJID[msg.SenderJID]; found {
+						msg.PushName = name
+					}
+				}
 				batch = append(batch, msg)
 				if len(batch) >= historyBridgeBatchSize {
 					emitBatch()
