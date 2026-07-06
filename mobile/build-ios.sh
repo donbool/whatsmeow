@@ -31,6 +31,11 @@ go get modernc.org/sqlite >/dev/null 2>&1 || true
 "$GOBIN/gomobile" bind -target=ios/arm64 -ldflags="-s -w" -o "$OUT" ./mobile/wa
 echo "Built: $OUT"
 
+# gomobile stamps MinimumOSVersion 100.0, which App Store archive validation
+# rejects; pin it to the app's deployment target (WhatsApp.podspec ios 18.0).
+/usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 18.0" \
+	"$OUT/ios-arm64/Wa.framework/Info.plist"
+
 # Install into the app module. Replace the destination outright: `cp -R` onto an
 # existing .xcframework directory nests the new framework inside it (a classic cp
 # gotcha), which leaves the app linked against the stale binary. Guarded so the
