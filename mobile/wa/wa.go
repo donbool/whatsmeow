@@ -252,7 +252,10 @@ func ensureSocket(c *whatsmeow.Client, timeout time.Duration) error {
 // SendText sends a plain text message to a recipient. The recipient is either a
 // bare phone number (digits only, no +) or a full JID ("<pn>@s.whatsapp.net" or
 // the privacy "<id>@lid" form) taken from a known thread — see resolveSendJID.
-func SendText(recipient string, text string) error {
+//
+// messageID pins the outgoing whatsmeow message ID (SendRequestExtra.ID) so the caller can reference the
+// resulting message before it syncs back; pass "" to let whatsmeow generate a random ID (the normal case).
+func SendText(recipient string, text string, messageID string) error {
 	mu.Lock()
 	c, ctx := client, rootCtx
 	mu.Unlock()
@@ -274,7 +277,8 @@ func SendText(recipient string, text string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
+	// An empty messageID yields an empty SendRequestExtra.ID, so whatsmeow generates a random one.
+	resp, err := c.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(text)}, whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)})
 	if err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
