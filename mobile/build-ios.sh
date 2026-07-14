@@ -37,7 +37,7 @@ go get modernc.org/sqlite >/dev/null 2>&1 || true
 # Device-only target (ios/arm64): we develop and ship on physical devices, so
 # the arm64 simulator slice is pure dead weight (~25MB). If you ever need the
 # iOS Simulator, append `,iossimulator/arm64` to -target and rebuild.
-"$GOBIN/gomobile" bind -target=ios/arm64 -trimpath -ldflags="-s -w" -o "$OUT" ./mobile/wa
+"$GOBIN/gomobile" bind -target=ios/arm64,iossimulator/arm64 -trimpath -ldflags="-s -w" -o "$OUT" ./mobile/wa
 echo "Built: $OUT"
 
 # gomobile stamps MinimumOSVersion 100.0, which App Store archive validation
