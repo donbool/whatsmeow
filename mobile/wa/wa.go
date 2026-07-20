@@ -33,6 +33,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -46,6 +47,18 @@ const historyBridgeBatchSize = 50
 // WhatsApp's practical image/video ceiling is ~16 MB; we read one byte past it
 // so we can detect (and reject) anything larger instead of streaming forever.
 const maxOutboundMediaBytes = 16 * 1024 * 1024
+
+// Set by mobile/build-ios.sh so a shipped framework can be traced back to the
+// exact source and gomobile toolchain that produced it.
+var (
+	buildSourceCommit    = "unknown"
+	buildGomobileVersion = "unknown"
+)
+
+// BuildInfo returns traceable release metadata embedded by the build script.
+func BuildInfo() string {
+	return fmt.Sprintf("source=%s;gomobile=%s", buildSourceCommit, buildGomobileVersion)
+}
 
 // Events is implemented on the host (Swift) side to receive async updates.
 //
@@ -61,6 +74,10 @@ type Events interface {
 	// time the phone pushes a history blob. Large blobs are split before they
 	// cross the Swift/JS bridge to avoid transient memory spikes.
 	OnHistorySync(payload string)
+	// OnGroupInfo delivers a group metadata update independently of messages.
+	// The host coalesces these by group JID and uploads them through the native
+	// sync engine without routing them through React Native.
+	OnGroupInfo(payload string)
 	OnError(stage string, message string)
 }
 
@@ -78,6 +95,10 @@ var (
 	// instead of capturing a single bridge for the life of the client.
 	evtMu      sync.RWMutex
 	currentEvt Events
+
+	groupStateMu         sync.Mutex
+	groupNameByJID       = make(map[string]string)
+	groupRefreshInFlight = make(map[string]struct{})
 )
 
 func setEvt(e Events) {
@@ -249,10 +270,23 @@ func ensureSocket(c *whatsmeow.Client, timeout time.Duration) error {
 	return nil
 }
 
-// SendText sends a plain text message to a recipient. The recipient is either a
-// bare phone number (digits only, no +) or a full JID ("<pn>@s.whatsapp.net" or
-// the privacy "<id>@lid" form) taken from a known thread — see resolveSendJID.
+// SendText sends a plain text message to a supported direct or group recipient,
+// allowing whatsmeow to generate the message ID.
 func SendText(recipient string, text string) error {
+	return sendText(recipient, text, "")
+}
+
+// SendTextWithID sends text with a caller-stable WhatsApp message ID. The app
+// uses this for confirmed jobs so a crash before the completion ACK cannot
+// generate a different WhatsApp ID on retry.
+func SendTextWithID(recipient string, text string, messageID string) error {
+	if err := validateMessageID(messageID); err != nil {
+		return err
+	}
+	return sendText(recipient, text, messageID)
+}
+
+func sendText(recipient string, text string, messageID string) error {
 	mu.Lock()
 	c, ctx := client, rootCtx
 	mu.Unlock()
@@ -274,7 +308,17 @@ func SendText(recipient string, text string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
+	var resp whatsmeow.SendResponse
+	if messageID == "" {
+		resp, err = c.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
+	} else {
+		resp, err = c.SendMessage(
+			ctx,
+			jid,
+			&waE2E.Message{Conversation: proto.String(text)},
+			whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)},
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
@@ -285,6 +329,18 @@ func SendText(recipient string, text string) error {
 	// against any later history-sync copy of the same message.
 	echoChatJID := canonicalJID(ctx, c, jid)
 	emitSentMessage(ctx, c, echoChatJID, string(resp.ID), text, resp.Timestamp)
+	return nil
+}
+
+func validateMessageID(messageID string) error {
+	if messageID == "" {
+		return errors.New("message id is required")
+	}
+	if strings.TrimSpace(messageID) != messageID ||
+		strings.ContainsAny(messageID, " \t\r\n") ||
+		len(messageID) > 128 {
+		return errors.New("invalid message id")
+	}
 	return nil
 }
 
@@ -556,6 +612,10 @@ func teardownLocked() {
 	dbConn = nil
 	rootCtx = nil
 	cancelCtx = nil
+	groupStateMu.Lock()
+	clear(groupNameByJID)
+	clear(groupRefreshInFlight)
+	groupStateMu.Unlock()
 }
 
 // waMessage is the JSON shape delivered to the host for both live and
@@ -568,12 +628,17 @@ func teardownLocked() {
 // counterparty. The host uses the phone to unify a chat with an existing contact
 // and the contact name to label it, instead of surfacing the opaque LID id.
 type waMessage struct {
-	ChatJID       string `json:"chatJID"`
-	SenderJID     string `json:"senderJID"`
-	MessageID     string `json:"messageID"`
-	TimestampSecs int64  `json:"timestampSecs"`
-	Text          string `json:"text"`
-	PushName      string `json:"pushName"`
+	ChatJID        string `json:"chatJID"`
+	SenderJID      string `json:"senderJID"`
+	SenderAltJID   string `json:"senderAltJID,omitempty"`
+	MessageID      string `json:"messageID"`
+	TimestampSecs  int64  `json:"timestampSecs"`
+	Text           string `json:"text"`
+	PushName       string `json:"pushName"`
+	ChatType       string `json:"chatType"`
+	ChatName       string `json:"chatName,omitempty"`
+	IsFromMe       bool   `json:"isFromMe"`
+	AddressingMode string `json:"addressingMode,omitempty"`
 	// Dialable phone (digits only, no +) resolved from each JID's LID->PN
 	// mapping; empty when the device knows no phone for that identity.
 	SenderPhoneNumber string `json:"senderPhoneNumber"`
@@ -583,7 +648,8 @@ type waMessage struct {
 }
 
 type historySyncPayload struct {
-	Messages []waMessage `json:"messages"`
+	Messages      []waMessage       `json:"messages"`
+	GroupMetadata []waGroupMetadata `json:"groupMetadata,omitempty"`
 	// PushNames carries counterparty display names from a PUSH_NAME history-sync
 	// event. That event has no messages, so the names are delivered to the host
 	// here (keyed by JID) and applied out-of-band rather than riding on a message.
@@ -604,6 +670,25 @@ type waPushName struct {
 	PhoneNumber string `json:"phoneNumber"`
 }
 
+// waGroupMetadata intentionally excludes the participant roster. MeGPT only
+// uploads people observed as message senders; the group title and lifecycle
+// flags are enough to identify and safely render the conversation.
+type waGroupMetadata struct {
+	GroupJID          string  `json:"groupJID"`
+	DisplayName       string  `json:"displayName,omitempty"`
+	ObservedAtSecs    int64   `json:"observedAtSecs"`
+	Source            string  `json:"source"`
+	ReadOnly          *bool   `json:"readOnly,omitempty"`
+	IsParent          *bool   `json:"isParent,omitempty"`
+	ParentGroupJID    string  `json:"parentGroupJID,omitempty"`
+	IsDefaultSubgroup *bool   `json:"isDefaultSubgroup,omitempty"`
+	IsAnnouncement    *bool   `json:"isAnnouncement,omitempty"`
+	IsEphemeral       *bool   `json:"isEphemeral,omitempty"`
+	DisappearingTimer *uint32 `json:"disappearingTimer,omitempty"`
+	Suspended         *bool   `json:"suspended,omitempty"`
+	Deleted           *bool   `json:"deleted,omitempty"`
+}
+
 // messageText pulls plain text out of a message, covering both simple
 // conversation messages and extended (link/quote) text. Non-text messages
 // (media, stickers, reactions, ...) return "" and are skipped while scope is
@@ -621,28 +706,115 @@ func messageText(msg *waE2E.Message) string {
 	return ""
 }
 
-// toWaMessage maps a parsed whatsmeow message to the host payload shape. ok is
-// false when the message should be skipped: group chats (scope is 1:1 DMs) and
-// non-text messages.
+// toWaMessage maps a parsed whatsmeow message to the host payload shape. Only
+// ordinary direct chats and message-bearing @g.us groups are admitted.
 func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (waMessage, bool) {
-	if m == nil || m.Info.IsGroup {
+	if m == nil {
+		return waMessage{}, false
+	}
+	chatType, ok := supportedChatType(m.Info)
+	if !ok {
+		return waMessage{}, false
+	}
+	// V1 group support has no expiry/edit/tombstone model, so do not retain
+	// content whose lifecycle we cannot honor. Direct behavior stays unchanged.
+	if chatType == "group" && (m.IsEphemeral || m.IsViewOnce || m.IsEdit) {
 		return waMessage{}, false
 	}
 	text := messageText(m.Message)
 	if text == "" {
 		return waMessage{}, false
 	}
+	senderJID := canonicalParticipantJID(ctx, c, m.Info.Sender, m.Info.SenderAlt)
+	senderPhone := dialablePhoneFromPair(ctx, c, m.Info.Sender, m.Info.SenderAlt)
+	contactTarget := m.Info.Chat
+	if chatType == "group" {
+		contactTarget = m.Info.Sender
+	}
+	contactName := deviceContactName(ctx, c, contactTarget)
+	if contactName == "" && chatType == "group" && !m.Info.SenderAlt.IsEmpty() {
+		contactName = deviceContactName(ctx, c, m.Info.SenderAlt)
+	}
+	chatName := ""
+	if chatType == "group" {
+		chatName = cachedGroupName(m.Info.Chat)
+	}
 	return waMessage{
 		ChatJID:           canonicalJID(ctx, c, m.Info.Chat).String(),
-		SenderJID:         canonicalJID(ctx, c, m.Info.Sender).String(),
+		SenderJID:         senderJID.String(),
+		SenderAltJID:      nonADJIDString(m.Info.SenderAlt),
 		MessageID:         string(m.Info.ID),
 		TimestampSecs:     m.Info.Timestamp.Unix(),
 		Text:              text,
 		PushName:          m.Info.PushName,
-		SenderPhoneNumber: dialablePhone(ctx, c, m.Info.Sender),
-		ChatPhoneNumber:   dialablePhone(ctx, c, m.Info.Chat),
-		ContactName:       deviceContactName(ctx, c, m.Info.Chat),
+		ChatType:          chatType,
+		ChatName:          chatName,
+		IsFromMe:          m.Info.IsFromMe,
+		AddressingMode:    string(m.Info.AddressingMode),
+		SenderPhoneNumber: senderPhone,
+		ChatPhoneNumber: func() string {
+			if chatType == "group" {
+				return ""
+			}
+			return dialablePhone(ctx, c, m.Info.Chat)
+		}(),
+		ContactName: contactName,
 	}, true
+}
+
+func supportedChatType(info types.MessageInfo) (string, bool) {
+	chat := info.Chat.ToNonAD()
+	switch chat.Server {
+	case types.GroupServer:
+		return "group", info.IsGroup && chat.User != ""
+	case types.DefaultUserServer, types.HiddenUserServer:
+		return "direct", !info.IsGroup && chat.User != ""
+	default:
+		return "", false
+	}
+}
+
+func nonADJIDString(jid types.JID) string {
+	if jid.IsEmpty() {
+		return ""
+	}
+	return jid.ToNonAD().String()
+}
+
+// canonicalParticipantJID prefers an explicit LID alternate before consulting
+// the store, eliminating the history-sync race where PN/LID mappings have not
+// finished persisting when the event reaches the wrapper.
+func canonicalParticipantJID(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	primary types.JID,
+	alternate types.JID,
+) types.JID {
+	for _, candidate := range []types.JID{primary.ToNonAD(), alternate.ToNonAD()} {
+		if candidate.Server == types.HiddenUserServer {
+			return candidate
+		}
+	}
+	return canonicalJID(ctx, c, primary)
+}
+
+func dialablePhoneFromPair(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	primary types.JID,
+	alternate types.JID,
+) string {
+	for _, candidate := range []types.JID{primary.ToNonAD(), alternate.ToNonAD()} {
+		if candidate.Server == types.DefaultUserServer {
+			return candidate.User
+		}
+	}
+	for _, candidate := range []types.JID{primary, alternate} {
+		if phone := dialablePhone(ctx, c, candidate); phone != "" {
+			return phone
+		}
+	}
+	return ""
 }
 
 // canonicalJID reduces any 1:1 user JID to a single stable identity so the same
@@ -767,12 +939,27 @@ func resolveSendJID(ctx context.Context, c *whatsmeow.Client, recipient string) 
 		return types.JID{}, fmt.Errorf("parse recipient jid %q: %w", recipient, err)
 	}
 	jid = jid.ToNonAD()
+	if !supportedSendJID(jid) {
+		return types.JID{}, fmt.Errorf("unsupported recipient jid server %q", jid.Server)
+	}
 	if jid.Server == types.HiddenUserServer && c != nil && c.Store != nil {
 		if pn, perr := c.Store.LIDs.GetPNForLID(ctx, jid); perr == nil && !pn.IsEmpty() {
 			return pn.ToNonAD(), nil
 		}
 	}
 	return jid, nil
+}
+
+func supportedSendJID(jid types.JID) bool {
+	if jid.User == "" {
+		return false
+	}
+	switch jid.Server {
+	case types.DefaultUserServer, types.HiddenUserServer, types.GroupServer:
+		return true
+	default:
+		return false
+	}
 }
 
 // emitSentMessage echoes a message we just sent through the same OnMessage path
@@ -791,15 +978,33 @@ func emitSentMessage(ctx context.Context, c *whatsmeow.Client, chat types.JID, i
 		ts = time.Now()
 	}
 	payload, err := json.Marshal(waMessage{
-		ChatJID:           chat.String(),
-		SenderJID:         canonicalJID(ctx, c, *c.Store.ID).String(),
-		MessageID:         id,
-		TimestampSecs:     ts.Unix(),
-		Text:              text,
-		PushName:          c.Store.PushName,
+		ChatJID:       chat.String(),
+		SenderJID:     canonicalJID(ctx, c, *c.Store.ID).String(),
+		MessageID:     id,
+		TimestampSecs: ts.Unix(),
+		Text:          text,
+		PushName:      c.Store.PushName,
+		ChatType: func() string {
+			if chat.Server == types.GroupServer {
+				return "group"
+			}
+			return "direct"
+		}(),
+		ChatName:          cachedGroupName(chat),
+		IsFromMe:          true,
 		SenderPhoneNumber: dialablePhone(ctx, c, *c.Store.ID),
-		ChatPhoneNumber:   dialablePhone(ctx, c, chat),
-		ContactName:       deviceContactName(ctx, c, chat),
+		ChatPhoneNumber: func() string {
+			if chat.Server == types.GroupServer {
+				return ""
+			}
+			return dialablePhone(ctx, c, chat)
+		}(),
+		ContactName: func() string {
+			if chat.Server == types.GroupServer {
+				return ""
+			}
+			return deviceContactName(ctx, c, chat)
+		}(),
 	})
 	if err != nil {
 		evt.OnError("encode_sent", err.Error())
@@ -827,12 +1032,25 @@ func dispatch(ctx context.Context, c *whatsmeow.Client, evt Events, raw interfac
 			return
 		}
 		evt.OnMessage(string(payload))
+		if msg.ChatType == "group" && msg.ChatName == "" {
+			requestGroupMetadataRefresh(ctx, c, e.Info.Chat)
+		}
 	case *events.HistorySync:
 		dispatchHistory(ctx, c, evt, e)
+	case *events.JoinedGroup:
+		if metadata, ok := groupMetadataFromGroupInfo(
+			&e.GroupInfo,
+			"joined_group",
+			time.Now(),
+		); ok {
+			emitGroupMetadata(evt, metadata)
+		}
+	case *events.GroupInfo:
+		dispatchGroupInfoEvent(ctx, c, evt, e)
 	}
 }
 
-// dispatchHistory streams a history blob into small, text-only 1:1 batches. A
+// dispatchHistory streams a history blob into small, text-only direct/group batches. A
 // full WhatsApp history blob can be large enough to duplicate memory several
 // times when marshaled through Go -> Swift -> JS, so never accumulate the whole
 // blob before emitting.
@@ -843,6 +1061,7 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 	syncType := e.Data.GetSyncType().String()
 	chunkOrder := e.Data.GetChunkOrder()
 	progress := e.Data.GetProgress()
+	storeHistoryMappings(ctx, c, e.Data.GetPhoneNumberToLidMappings())
 	// WhatsApp ships counterparty display names (pushNames) in a dedicated
 	// PUSH_NAME history-sync event — a payload that carries NO messages, keyed by
 	// JID. Since the LID/privacy migration the per-message PushName is left blank
@@ -897,6 +1116,33 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 		batch = make([]waMessage, 0, historyBridgeBatchSize)
 	}
 
+	groupMetadata := make([]waGroupMetadata, 0)
+	for _, conv := range e.Data.GetConversations() {
+		if metadata, ok := groupMetadataFromHistory(conv, time.Now()); ok {
+			cacheGroupName(metadata.GroupJID, metadata.DisplayName)
+			groupMetadata = append(groupMetadata, metadata)
+		}
+	}
+	for len(groupMetadata) > 0 {
+		count := min(historyBridgeBatchSize, len(groupMetadata))
+		groupBatch := groupMetadata[:count]
+		groupMetadata = groupMetadata[count:]
+		payload, err := json.Marshal(historySyncPayload{
+			Messages:      []waMessage{},
+			GroupMetadata: groupBatch,
+			SyncType:      syncType,
+			ChunkOrder:    chunkOrder,
+			Progress:      progress,
+			BatchIndex:    batchIndex,
+		})
+		if err != nil {
+			evt.OnError("encode_history_groups", err.Error())
+			break
+		}
+		evt.OnHistorySync(string(payload))
+		batchIndex++
+	}
+
 	// Deliver counterparty names first, in their own payload. WhatsApp sends them
 	// in a messages-less PUSH_NAME event, so this is normally the only thing that
 	// event produces; emitting it lets the backend upgrade a thread still labeled
@@ -924,8 +1170,8 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 
 	for _, conv := range e.Data.GetConversations() {
 		for _, histMsg := range conv.GetMessages() {
-			// Empty chat JID lets ParseWebMessage derive it from the message key.
-			parsed, err := c.ParseWebMessage(types.JID{}, histMsg.GetMessage())
+			chatJID, _ := types.ParseJID(conv.GetID())
+			parsed, err := c.ParseWebMessage(chatJID, histMsg.GetMessage())
 			if err != nil {
 				continue
 			}
@@ -946,4 +1192,181 @@ func dispatchHistory(ctx context.Context, c *whatsmeow.Client, evt Events, e *ev
 		}
 	}
 	emitBatch()
+}
+
+func storeHistoryMappings(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	mappings []*waHistorySync.PhoneNumberToLIDMapping,
+) {
+	if c == nil || c.Store == nil || len(mappings) == 0 {
+		return
+	}
+	pairs := make([]store.LIDMapping, 0, len(mappings))
+	for _, mapping := range mappings {
+		pn, pnErr := types.ParseJID(mapping.GetPnJID())
+		lid, lidErr := types.ParseJID(mapping.GetLidJID())
+		if pnErr != nil || lidErr != nil {
+			continue
+		}
+		if pn.Server == types.LegacyUserServer {
+			pn.Server = types.DefaultUserServer
+		}
+		if pn.Server != types.DefaultUserServer || lid.Server != types.HiddenUserServer {
+			continue
+		}
+		pairs = append(pairs, store.LIDMapping{PN: pn.ToNonAD(), LID: lid.ToNonAD()})
+	}
+	if len(pairs) == 0 {
+		return
+	}
+	if err := c.Store.LIDs.PutManyLIDMappings(ctx, pairs); err != nil {
+		c.Log.Warnf("Failed to synchronously store %d history PN/LID mappings: %v", len(pairs), err)
+	}
+}
+
+func groupMetadataFromHistory(
+	conv *waHistorySync.Conversation,
+	observedAt time.Time,
+) (waGroupMetadata, bool) {
+	if conv == nil {
+		return waGroupMetadata{}, false
+	}
+	jid, err := types.ParseJID(conv.GetID())
+	if err != nil || jid.Server != types.GroupServer || jid.User == "" || conv.GetIsParentGroup() {
+		return waGroupMetadata{}, false
+	}
+	readOnly := conv.GetReadOnly()
+	isParent := false
+	isDefaultSubgroup := conv.GetIsDefaultSubgroup()
+	isEphemeral := conv.GetEphemeralExpiration() > 0
+	timer := conv.GetEphemeralExpiration()
+	suspended := conv.GetSuspended()
+	deleted := conv.GetTerminated()
+	return waGroupMetadata{
+		GroupJID:          jid.ToNonAD().String(),
+		DisplayName:       firstNonEmpty(conv.GetName(), conv.GetDisplayName()),
+		ObservedAtSecs:    observedAt.Unix(),
+		Source:            "history",
+		ReadOnly:          &readOnly,
+		IsParent:          &isParent,
+		ParentGroupJID:    conv.GetParentGroupID(),
+		IsDefaultSubgroup: &isDefaultSubgroup,
+		IsEphemeral:       &isEphemeral,
+		DisappearingTimer: &timer,
+		Suspended:         &suspended,
+		Deleted:           &deleted,
+	}, true
+}
+
+func groupMetadataFromGroupInfo(
+	info *types.GroupInfo,
+	source string,
+	observedAt time.Time,
+) (waGroupMetadata, bool) {
+	if info == nil || info.JID.Server != types.GroupServer || info.JID.User == "" || info.IsParent {
+		return waGroupMetadata{}, false
+	}
+	isParent := info.IsParent
+	isDefaultSubgroup := info.IsDefaultSubGroup
+	isAnnouncement := info.IsAnnounce
+	isEphemeral := info.IsEphemeral
+	timer := info.DisappearingTimer
+	suspended := info.Suspended
+	return waGroupMetadata{
+		GroupJID:          info.JID.ToNonAD().String(),
+		DisplayName:       strings.TrimSpace(info.Name),
+		ObservedAtSecs:    observedAt.Unix(),
+		Source:            source,
+		IsParent:          &isParent,
+		ParentGroupJID:    nonADJIDString(info.LinkedParentJID),
+		IsDefaultSubgroup: &isDefaultSubgroup,
+		IsAnnouncement:    &isAnnouncement,
+		IsEphemeral:       &isEphemeral,
+		DisappearingTimer: &timer,
+		Suspended:         &suspended,
+	}, true
+}
+
+func dispatchGroupInfoEvent(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	evt Events,
+	event *events.GroupInfo,
+) {
+	if event == nil || event.JID.Server != types.GroupServer || event.JID.User == "" {
+		return
+	}
+	if event.Delete != nil && event.Delete.Deleted {
+		deleted := true
+		emitGroupMetadata(evt, waGroupMetadata{
+			GroupJID:       event.JID.ToNonAD().String(),
+			ObservedAtSecs: event.Timestamp.Unix(),
+			Source:         "group_info_event",
+			Deleted:        &deleted,
+		})
+		return
+	}
+	requestGroupMetadataRefresh(ctx, c, event.JID)
+}
+
+func requestGroupMetadataRefresh(ctx context.Context, c *whatsmeow.Client, jid types.JID) {
+	jid = jid.ToNonAD()
+	if c == nil || jid.Server != types.GroupServer || jid.User == "" {
+		return
+	}
+	key := jid.String()
+	groupStateMu.Lock()
+	if _, exists := groupRefreshInFlight[key]; exists {
+		groupStateMu.Unlock()
+		return
+	}
+	groupRefreshInFlight[key] = struct{}{}
+	groupStateMu.Unlock()
+
+	go func() {
+		defer func() {
+			groupStateMu.Lock()
+			delete(groupRefreshInFlight, key)
+			groupStateMu.Unlock()
+		}()
+		info, err := c.GetGroupInfo(ctx, jid)
+		if err != nil {
+			c.Log.Warnf("Failed to refresh group metadata for %s: %v", jid, err)
+			return
+		}
+		metadata, ok := groupMetadataFromGroupInfo(info, "live_refresh", time.Now())
+		if !ok {
+			return
+		}
+		if evt := getEvt(); evt != nil {
+			emitGroupMetadata(evt, metadata)
+		}
+	}()
+}
+
+func emitGroupMetadata(evt Events, metadata waGroupMetadata) {
+	cacheGroupName(metadata.GroupJID, metadata.DisplayName)
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		evt.OnError("encode_group_info", err.Error())
+		return
+	}
+	evt.OnGroupInfo(string(payload))
+}
+
+func cacheGroupName(groupJID string, displayName string) {
+	displayName = strings.TrimSpace(displayName)
+	if groupJID == "" || displayName == "" {
+		return
+	}
+	groupStateMu.Lock()
+	groupNameByJID[groupJID] = displayName
+	groupStateMu.Unlock()
+}
+
+func cachedGroupName(jid types.JID) string {
+	groupStateMu.Lock()
+	defer groupStateMu.Unlock()
+	return groupNameByJID[jid.ToNonAD().String()]
 }
