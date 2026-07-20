@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,7 @@ import (
 )
 
 const historyBridgeBatchSize = 50
+const wrapperSchemaVersion = 1
 
 // maxOutboundMediaBytes bounds how much we download for an outbound media send.
 // WhatsApp's practical image/video ceiling is ~16 MB; we read one byte past it
@@ -58,6 +60,26 @@ var (
 // BuildInfo returns traceable release metadata embedded by the build script.
 func BuildInfo() string {
 	return fmt.Sprintf("source=%s;gomobile=%s", buildSourceCommit, buildGomobileVersion)
+}
+
+type wrapperCapabilities struct {
+	SchemaVersion int      `json:"schemaVersion"`
+	Features      []string `json:"features"`
+}
+
+// Capabilities lets the host gate native features without inferring support
+// from the app or framework release version.
+func Capabilities() string {
+	payload, _ := json.Marshal(wrapperCapabilities{
+		SchemaVersion: wrapperSchemaVersion,
+		Features: []string{
+			"group_metadata_v1",
+			"groups_v1",
+			"list_groups_v1",
+			"stable_send_id",
+		},
+	})
+	return string(payload)
 }
 
 // Events is implemented on the host (Swift) side to receive async updates.
@@ -223,6 +245,60 @@ func IsConnected() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return client != nil && client.IsConnected()
+}
+
+type groupListPayload struct {
+	SchemaVersion int               `json:"schemaVersion"`
+	Groups        []waGroupMetadata `json:"groups"`
+}
+
+// ListGroups returns metadata-only shells for all joined, message-bearing
+// groups. Participant rosters are deliberately excluded; MeGPT learns people
+// only from accepted message senders.
+func ListGroups() (string, error) {
+	mu.Lock()
+	c, ctx := client, rootCtx
+	mu.Unlock()
+	if c == nil {
+		return "", errors.New("not started")
+	}
+	if c.Store == nil || c.Store.ID == nil {
+		return "", errors.New("not logged in")
+	}
+	if err := ensureSocket(c, 15*time.Second); err != nil {
+		return "", err
+	}
+	if !c.WaitForConnection(15 * time.Second) {
+		return "", errors.New("timed out waiting for WhatsApp login")
+	}
+	groups, err := c.GetJoinedGroups(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get joined groups: %w", err)
+	}
+	return encodeGroupList(groups, time.Now())
+}
+
+func encodeGroupList(groups []*types.GroupInfo, observedAt time.Time) (string, error) {
+	metadata := make([]waGroupMetadata, 0, len(groups))
+	for _, group := range groups {
+		item, ok := groupMetadataFromGroupInfo(group, "joined_groups", observedAt)
+		if !ok {
+			continue
+		}
+		cacheGroupName(item.GroupJID, item.DisplayName)
+		metadata = append(metadata, item)
+	}
+	sort.Slice(metadata, func(i, j int) bool {
+		return metadata[i].GroupJID < metadata[j].GroupJID
+	})
+	payload, err := json.Marshal(groupListPayload{
+		SchemaVersion: wrapperSchemaVersion,
+		Groups:        metadata,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode joined groups: %w", err)
+	}
+	return string(payload), nil
 }
 
 // RequestPairingCode links this device to the given phone number (full
@@ -685,6 +761,7 @@ type waGroupMetadata struct {
 	IsAnnouncement    *bool   `json:"isAnnouncement,omitempty"`
 	IsEphemeral       *bool   `json:"isEphemeral,omitempty"`
 	DisappearingTimer *uint32 `json:"disappearingTimer,omitempty"`
+	ParticipantCount  int     `json:"participantCount,omitempty"`
 	Suspended         *bool   `json:"suspended,omitempty"`
 	Deleted           *bool   `json:"deleted,omitempty"`
 }
@@ -1254,6 +1331,7 @@ func groupMetadataFromHistory(
 		IsDefaultSubgroup: &isDefaultSubgroup,
 		IsEphemeral:       &isEphemeral,
 		DisappearingTimer: &timer,
+		ParticipantCount:  len(conv.GetParticipant()),
 		Suspended:         &suspended,
 		Deleted:           &deleted,
 	}, true
@@ -1272,6 +1350,10 @@ func groupMetadataFromGroupInfo(
 	isAnnouncement := info.IsAnnounce
 	isEphemeral := info.IsEphemeral
 	timer := info.DisappearingTimer
+	participantCount := info.ParticipantCount
+	if participantCount == 0 {
+		participantCount = len(info.Participants)
+	}
 	suspended := info.Suspended
 	return waGroupMetadata{
 		GroupJID:          info.JID.ToNonAD().String(),
@@ -1284,6 +1366,7 @@ func groupMetadataFromGroupInfo(
 		IsAnnouncement:    &isAnnouncement,
 		IsEphemeral:       &isEphemeral,
 		DisappearingTimer: &timer,
+		ParticipantCount:  participantCount,
 		Suspended:         &suspended,
 	}, true
 }

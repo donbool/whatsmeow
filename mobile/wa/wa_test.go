@@ -2,6 +2,7 @@ package wa
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -247,6 +248,89 @@ func TestGroupMetadataFromGroupInfo(t *testing.T) {
 	info.IsParent = true
 	if _, ok := groupMetadataFromGroupInfo(info, "test", time.Now()); ok {
 		t.Fatal("community parent containers must not be emitted")
+	}
+}
+
+func TestCapabilitiesAdvertiseOnlyImplementedFeatures(t *testing.T) {
+	var capabilities wrapperCapabilities
+	if err := json.Unmarshal([]byte(Capabilities()), &capabilities); err != nil {
+		t.Fatalf("capabilities must be valid JSON: %v", err)
+	}
+	if capabilities.SchemaVersion != wrapperSchemaVersion {
+		t.Fatalf(
+			"expected schema version %d, got %d",
+			wrapperSchemaVersion,
+			capabilities.SchemaVersion,
+		)
+	}
+	expected := []string{
+		"group_metadata_v1",
+		"groups_v1",
+		"list_groups_v1",
+		"stable_send_id",
+	}
+	if strings.Join(capabilities.Features, ",") != strings.Join(expected, ",") {
+		t.Fatalf("unexpected capabilities: %#v", capabilities.Features)
+	}
+}
+
+func TestEncodeGroupListIsMetadataOnlyAndDeterministic(t *testing.T) {
+	parent := &types.GroupInfo{
+		JID:         types.NewJID("120363000000000009", types.GroupServer),
+		GroupParent: types.GroupParent{IsParent: true},
+		GroupName:   types.GroupName{Name: "Community container"},
+	}
+	second := &types.GroupInfo{
+		JID:              types.NewJID("120363000000000008", types.GroupServer),
+		GroupName:        types.GroupName{Name: "Second"},
+		ParticipantCount: 8,
+		Participants: []types.GroupParticipant{
+			{JID: types.NewJID("15550000001", types.DefaultUserServer)},
+		},
+	}
+	first := &types.GroupInfo{
+		JID:       types.NewJID("120363000000000007", types.GroupServer),
+		GroupName: types.GroupName{Name: "First"},
+		Participants: []types.GroupParticipant{
+			{JID: types.NewJID("15550000002", types.DefaultUserServer)},
+			{JID: types.NewJID("15550000003", types.DefaultUserServer)},
+		},
+	}
+
+	payload, err := encodeGroupList(
+		[]*types.GroupInfo{second, parent, first},
+		time.Unix(1_700_000_006, 0),
+	)
+	if err != nil {
+		t.Fatalf("encode group list: %v", err)
+	}
+	var decoded groupListPayload
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("decode group list: %v", err)
+	}
+	if len(decoded.Groups) != 2 {
+		t.Fatalf("expected two message-bearing groups, got %d", len(decoded.Groups))
+	}
+	if decoded.Groups[0].DisplayName != "First" || decoded.Groups[1].DisplayName != "Second" {
+		t.Fatalf("groups must be sorted by JID: %#v", decoded.Groups)
+	}
+	if decoded.Groups[0].ParticipantCount != 2 {
+		t.Fatalf("expected participant count fallback, got %d", decoded.Groups[0].ParticipantCount)
+	}
+	if decoded.Groups[1].ParticipantCount != 8 {
+		t.Fatalf("expected explicit participant count, got %d", decoded.Groups[1].ParticipantCount)
+	}
+
+	var raw struct {
+		Groups []map[string]any `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		t.Fatalf("decode raw group list: %v", err)
+	}
+	for _, group := range raw.Groups {
+		if _, leakedRoster := group["participants"]; leakedRoster {
+			t.Fatal("group list must not expose participant rosters")
+		}
 	}
 }
 
