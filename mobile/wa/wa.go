@@ -238,6 +238,24 @@ func OwnJID() string {
 	return canonicalJID(ctx, c, *c.Store.ID).String()
 }
 
+// OwnLIDJID returns this device's own LID (the account's privacy alias, delivered at
+// pairing), or "" when not paired or the LID is not yet known. It reads Store.LID —
+// authenticated self-identity — never the per-contact LID map, which can go stale and
+// mis-pair identities. Shipped alongside OwnJID so the server can attribute the owner's
+// LID-addressed messages without per-message inference.
+func OwnLIDJID() string {
+	mu.Lock()
+	defer mu.Unlock()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		return ""
+	}
+	lid := client.Store.LID
+	if lid.IsEmpty() {
+		return ""
+	}
+	return lid.ToNonAD().String()
+}
+
 // IsConnected reports whether the websocket is currently connected. This is
 // independent of login state (an unpaired client can be connected while it
 // waits to be linked).
