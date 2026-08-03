@@ -29,6 +29,73 @@ func resetGroupStateForTest() {
 	groupStateMu.Unlock()
 }
 
+// The own-message fallback must recognize every own-identity form the device can
+// resolve (own LID via the LID DB, phone-form alternates, resolved phone) without
+// ever claiming someone else's message.
+func TestSenderMatchesOwnIdentity(t *testing.T) {
+	ownPN := types.NewJID("15551234567", types.DefaultUserServer)
+	ownLID := types.NewJID("241000000000001", types.HiddenUserServer)
+	otherLID := types.NewJID("352000000000123", types.HiddenUserServer)
+	otherPN := types.NewJID("15559998888", types.DefaultUserServer)
+	empty := types.JID{}
+
+	cases := []struct {
+		name         string
+		sender       types.JID
+		senderAlt    types.JID
+		senderPhone  string
+		ownPN        types.JID
+		ownCanonical types.JID
+		want         bool
+	}{
+		{"own LID sender via canonical own JID", ownLID, empty, "", ownPN, ownLID, true},
+		{"own LID sender with no canonical mapping", ownLID, empty, "", ownPN, ownPN, false},
+		{"phone-form alternate names the own account", otherLID, ownPN, "", ownPN, ownPN, true},
+		{"resolved phone names the own account", ownLID, empty, "15551234567", ownPN, ownPN, true},
+		{"someone else's LID and phone", otherLID, otherPN, "15559998888", ownPN, ownLID, false},
+		{"unpaired device (empty own JID) never matches", ownLID, empty, "15551234567", empty, empty, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := senderMatchesOwnIdentity(tc.sender, tc.senderAlt, tc.senderPhone, tc.ownPN, tc.ownCanonical)
+			if got != tc.want {
+				t.Fatalf("senderMatchesOwnIdentity(%s, %s, %q) = %v, want %v",
+					tc.sender, tc.senderAlt, tc.senderPhone, got, tc.want)
+			}
+		})
+	}
+}
+
+// Without a client (no Store), toWaMessage must pass the upstream IsFromMe bit
+// through unchanged in both directions.
+func TestToWaMessagePreservesIsFromMeWithoutStore(t *testing.T) {
+	resetGroupStateForTest()
+	group := types.NewJID("120363000000000009", types.GroupServer)
+	senderLID := types.NewJID("241000000000001", types.HiddenUserServer)
+
+	for _, isFromMe := range []bool{true, false} {
+		event := makeTextEvent(types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:           group,
+				Sender:         senderLID,
+				IsGroup:        true,
+				IsFromMe:       isFromMe,
+				AddressingMode: types.AddressingModeLID,
+			},
+			ID:        "own-bit-passthrough",
+			Timestamp: time.Unix(1_700_000_050, 0),
+		}, "own bit")
+
+		message, ok := toWaMessage(context.Background(), nil, event)
+		if !ok {
+			t.Fatal("expected group text to be accepted")
+		}
+		if message.IsFromMe != isFromMe {
+			t.Fatalf("IsFromMe = %v, want %v", message.IsFromMe, isFromMe)
+		}
+	}
+}
+
 func TestToWaMessageMapsGroupSenderSeparatelyFromChat(t *testing.T) {
 	resetGroupStateForTest()
 	group := types.NewJID("120363000000000000", types.GroupServer)

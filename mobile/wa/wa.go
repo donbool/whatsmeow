@@ -804,13 +804,44 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 	}
 	senderJID := canonicalParticipantJID(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	senderPhone := dialablePhoneFromPair(ctx, c, m.Info.Sender, m.Info.SenderAlt)
+	// whatsmeow computes IsFromMe for group messages by comparing the participant
+	// against Store.ID/Store.LID only; with an absent or stale own-LID mapping the
+	// device sees its own LID-addressed group messages as IsFromMe=false, and the
+	// host then treats the owner's message as inbound (it gets summarized back to
+	// the user as if a friend sent it). Re-derive ownership from every own-identity
+	// form the device can resolve before shipping the message.
+	isFromMe := m.Info.IsFromMe
+	if !isFromMe && c != nil && c.Store != nil && c.Store.ID != nil {
+		isFromMe = senderMatchesOwnIdentity(
+			m.Info.Sender,
+			m.Info.SenderAlt,
+			senderPhone,
+			c.Store.ID.ToNonAD(),
+			canonicalJID(ctx, c, *c.Store.ID),
+		)
+	}
+	if isFromMe && c != nil && c.Store != nil && c.Store.ID != nil {
+		// An own message must never ship a third party's identity. The same stale
+		// LID store that loses IsFromMe can resolve the owner's group LID to a
+		// *contact's* phone, and the host then renders the owner's own message as
+		// that contact (and phone-links the owner's LID row to them). The
+		// account's own number is the only correct value here.
+		senderPhone = c.Store.ID.User
+	}
 	contactTarget := m.Info.Chat
 	if chatType == "group" {
 		contactTarget = m.Info.Sender
 	}
-	contactName := deviceContactName(ctx, c, contactTarget)
-	if contactName == "" && chatType == "group" && !m.Info.SenderAlt.IsEmpty() {
-		contactName = deviceContactName(ctx, c, m.Info.SenderAlt)
+	contactName := ""
+	// In groups the contact name is resolved against the sender; for an own
+	// message that lookup can only name the owner or — through a stale LID
+	// mapping — the wrong contact entirely, so skip it (direct chats resolve
+	// against the counterparty chat JID and stay correct for own messages).
+	if !(chatType == "group" && isFromMe) {
+		contactName = deviceContactName(ctx, c, contactTarget)
+		if contactName == "" && chatType == "group" && !m.Info.SenderAlt.IsEmpty() {
+			contactName = deviceContactName(ctx, c, m.Info.SenderAlt)
+		}
 	}
 	chatName := ""
 	if chatType == "group" {
@@ -826,7 +857,7 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		PushName:          m.Info.PushName,
 		ChatType:          chatType,
 		ChatName:          chatName,
-		IsFromMe:          m.Info.IsFromMe,
+		IsFromMe:          isFromMe,
 		AddressingMode:    string(m.Info.AddressingMode),
 		SenderPhoneNumber: senderPhone,
 		ChatPhoneNumber: func() string {
@@ -837,6 +868,36 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		}(),
 		ContactName: contactName,
 	}, true
+}
+
+// senderMatchesOwnIdentity reports whether a message's sender resolves to this
+// device's own WhatsApp account, using identity forms whatsmeow's own IsFromMe
+// computation does not consult: the canonical (LID-preferred, via the LID
+// database rather than Store.LID) own JID, the sender's device-paired alternate
+// form, and the sender's resolved dialable phone. User-part comparison matches
+// upstream message.go's own convention.
+func senderMatchesOwnIdentity(
+	sender types.JID,
+	senderAlt types.JID,
+	senderPhone string,
+	ownPN types.JID,
+	ownCanonical types.JID,
+) bool {
+	if ownPN.IsEmpty() {
+		return false
+	}
+	for _, candidate := range []types.JID{sender.ToNonAD(), senderAlt.ToNonAD()} {
+		if candidate.IsEmpty() {
+			continue
+		}
+		if candidate.User == ownPN.User {
+			return true
+		}
+		if !ownCanonical.IsEmpty() && candidate.User == ownCanonical.User {
+			return true
+		}
+	}
+	return senderPhone != "" && senderPhone == ownPN.User
 }
 
 func supportedChatType(info types.MessageInfo) (string, bool) {
