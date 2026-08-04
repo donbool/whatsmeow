@@ -9,8 +9,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -436,5 +438,193 @@ func TestValidateMessageID(t *testing.T) {
 		if err := validateMessageID(value); err == nil {
 			t.Fatalf("expected invalid message ID %q to be rejected", value)
 		}
+	}
+}
+
+func makeExtendedTextEvent(info types.MessageInfo, text string, mentionedJIDs []string) *events.Message {
+	return &events.Message{
+		Info: info,
+		Message: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text:        proto.String(text),
+				ContextInfo: &waE2E.ContextInfo{MentionedJID: mentionedJIDs},
+			},
+		},
+	}
+}
+
+// fakeContactStore serves GetContact from a map; every other ContactStore
+// method panics via the embedded nil interface, which no tested path calls.
+type fakeContactStore struct {
+	store.ContactStore
+	contacts map[string]types.ContactInfo
+}
+
+func (f *fakeContactStore) GetContact(_ context.Context, user types.JID) (types.ContactInfo, error) {
+	return f.contacts[user.String()], nil
+}
+
+// fakeLIDStore serves the two lookup methods from maps (zero JID = no
+// mapping); every other LIDStore method panics via the embedded nil interface.
+type fakeLIDStore struct {
+	store.LIDStore
+	pnByLID map[string]types.JID
+	lidByPN map[string]types.JID
+}
+
+func (f *fakeLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
+	return f.pnByLID[lid.String()], nil
+}
+
+func (f *fakeLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	return f.lidByPN[pn.String()], nil
+}
+
+func makeMentionResolutionClient(
+	ownJID *types.JID,
+	ownPushName string,
+	contacts map[string]types.ContactInfo,
+) *whatsmeow.Client {
+	return &whatsmeow.Client{Store: &store.Device{
+		ID:       ownJID,
+		PushName: ownPushName,
+		Contacts: &fakeContactStore{contacts: contacts},
+		LIDs:     &fakeLIDStore{},
+	}}
+}
+
+// Mention tokens must surface as names when the device knows them: the wire
+// text only carries "@<jid user part>", which is meaningless to everything
+// downstream of the device.
+func TestResolveMentionTokensResolvesKnownNames(t *testing.T) {
+	ctx := context.Background()
+	bolajiLID := types.NewJID("248506975531090", types.HiddenUserServer)
+	andrewLID := types.NewJID("170090066657309", types.HiddenUserServer)
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{
+		// Known only by WhatsApp display name (pushName).
+		bolajiLID.String(): {Found: true, PushName: "Bolaji"},
+		// Saved in the address book, which wins over pushName.
+		andrewLID.String(): {Found: true, FullName: "Andrew Zhang", PushName: "andz"},
+	})
+
+	msg := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String("@248506975531090, for @170090066657309, any housing groups in tech treks?"),
+			ContextInfo: &waE2E.ContextInfo{
+				MentionedJID: []string{bolajiLID.String(), andrewLID.String()},
+			},
+		},
+	}
+	got := resolveMentionTokens(ctx, client, msg, messageText(msg))
+	want := "@Bolaji, for @Andrew Zhang, any housing groups in tech treks?"
+	if got != want {
+		t.Fatalf("resolved text = %q, want %q", got, want)
+	}
+}
+
+// A mention the device cannot name must stay raw instead of degrading the text.
+func TestResolveMentionTokensLeavesUnknownMentionsRaw(t *testing.T) {
+	ctx := context.Background()
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{})
+	msg := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("ping @999000111222333"),
+			ContextInfo: &waE2E.ContextInfo{MentionedJID: []string{"999000111222333@lid"}},
+		},
+	}
+	if got := resolveMentionTokens(ctx, client, msg, messageText(msg)); got != "ping @999000111222333" {
+		t.Fatalf("unknown mention must stay raw, got %q", got)
+	}
+}
+
+// A mention of the owner must resolve to the owner's own display name — it is
+// the strongest "this message is addressed to the user" signal downstream.
+func TestResolveMentionTokensResolvesOwnerMention(t *testing.T) {
+	ctx := context.Background()
+	ownPN := types.NewJID("15551234567", types.DefaultUserServer)
+	client := makeMentionResolutionClient(&ownPN, "Benji", map[string]types.ContactInfo{})
+	msg := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("@15551234567 you seeing this?"),
+			ContextInfo: &waE2E.ContextInfo{MentionedJID: []string{ownPN.String()}},
+		},
+	}
+	if got := resolveMentionTokens(ctx, client, msg, messageText(msg)); got != "@Benji you seeing this?" {
+		t.Fatalf("owner mention must use own push name, got %q", got)
+	}
+}
+
+// Replacing a shorter token first would corrupt a longer token sharing its
+// prefix, so resolution must go longest-first.
+func TestResolveMentionTokensHandlesPrefixCollisions(t *testing.T) {
+	ctx := context.Background()
+	shortPN := types.NewJID("1234", types.DefaultUserServer)
+	longPN := types.NewJID("12345", types.DefaultUserServer)
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{
+		shortPN.String(): {Found: true, FullName: "Short Num"},
+		longPN.String():  {Found: true, FullName: "Long Num"},
+	})
+	msg := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("hey @12345 and @1234"),
+			ContextInfo: &waE2E.ContextInfo{MentionedJID: []string{shortPN.String(), longPN.String()}},
+		},
+	}
+	got := resolveMentionTokens(ctx, client, msg, messageText(msg))
+	if got != "hey @Long Num and @Short Num" {
+		t.Fatalf("prefix collision mishandled: %q", got)
+	}
+}
+
+// Without a client there is nothing to resolve against; the text must pass
+// through untouched (in particular, a phone token must not be "replaced" with
+// the same digits).
+func TestResolveMentionTokensWithoutClient(t *testing.T) {
+	ctx := context.Background()
+	for _, text := range []string{"@248506975531090 hello", "@15551234567 hello"} {
+		msg := &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String(text),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{"248506975531090@lid", "15551234567@s.whatsapp.net"},
+				},
+			},
+		}
+		if got := resolveMentionTokens(ctx, nil, msg, messageText(msg)); got != text {
+			t.Fatalf("nil-client resolution must be a no-op, got %q from %q", got, text)
+		}
+	}
+}
+
+// End to end through toWaMessage: the shipped payload text carries the
+// resolved mention.
+func TestToWaMessageResolvesMentionTokens(t *testing.T) {
+	resetGroupStateForTest()
+	group := types.NewJID("120363000000000010", types.GroupServer)
+	senderLID := types.NewJID("352000000000123", types.HiddenUserServer)
+	bolajiLID := types.NewJID("248506975531090", types.HiddenUserServer)
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{
+		bolajiLID.String(): {Found: true, PushName: "Bolaji"},
+	})
+
+	event := makeExtendedTextEvent(types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:           group,
+			Sender:         senderLID,
+			IsGroup:        true,
+			IsFromMe:       false,
+			AddressingMode: types.AddressingModeLID,
+		},
+		ID:        "mention-message-1",
+		Timestamp: time.Unix(1_700_000_060, 0),
+		PushName:  "Mike",
+	}, "@248506975531090 are there any housing groups?", []string{bolajiLID.String()})
+
+	message, ok := toWaMessage(context.Background(), client, event)
+	if !ok {
+		t.Fatal("expected mention-bearing group text to be accepted")
+	}
+	if message.Text != "@Bolaji are there any housing groups?" {
+		t.Fatalf("expected resolved mention in payload text, got %q", message.Text)
 	}
 }

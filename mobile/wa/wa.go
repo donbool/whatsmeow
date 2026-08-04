@@ -801,6 +801,100 @@ func messageText(msg *waE2E.Message) string {
 	return ""
 }
 
+// resolveMentionTokens rewrites raw @-mention tokens into readable names.
+// WhatsApp renders a mention in the wire text as "@<jid user part>" (a phone
+// number or, post-LID-migration, an opaque 15-digit LID) and carries the
+// mentioned JIDs in ContextInfo.MentionedJID. Downstream consumers (the
+// backend's summaries and prompts) only ever see the flat text, so an
+// unresolved token like "@248506975531090" hides who a message is addressed
+// to. The device is the only place with the full contact store, so the
+// rewrite happens here, at capture. Tokens that resolve to no name are left
+// untouched rather than degraded.
+func resolveMentionTokens(ctx context.Context, c *whatsmeow.Client, msg *waE2E.Message, text string) string {
+	mentioned := msg.GetExtendedTextMessage().GetContextInfo().GetMentionedJID()
+	if len(mentioned) == 0 || !strings.ContainsRune(text, '@') {
+		return text
+	}
+	jids := make([]types.JID, 0, len(mentioned))
+	for _, raw := range mentioned {
+		jid, err := types.ParseJID(raw)
+		if err != nil || jid.User == "" {
+			continue
+		}
+		jids = append(jids, jid)
+	}
+	// Longest user part first so replacing "@1234" can never corrupt a
+	// longer token like "@12345" that shares the prefix.
+	sort.SliceStable(jids, func(i, j int) bool {
+		return len(jids[i].User) > len(jids[j].User)
+	})
+	for _, jid := range jids {
+		token := "@" + jid.User
+		if !strings.Contains(text, token) {
+			continue
+		}
+		name := mentionDisplayName(ctx, c, jid)
+		if name == "" || name == jid.User {
+			continue
+		}
+		text = strings.ReplaceAll(text, token, "@"+name)
+	}
+	return text
+}
+
+// mentionDisplayName resolves a mentioned JID to the best human-readable name
+// the device knows: the owner's own display name when the owner is mentioned
+// (the strongest signal a message is addressed to the user), then the saved
+// address-book name, the contact's WhatsApp display name (pushName), and
+// finally the dialable phone number.
+func mentionDisplayName(ctx context.Context, c *whatsmeow.Client, jid types.JID) string {
+	if c != nil && c.Store != nil && c.Store.ID != nil {
+		own := c.Store.ID.ToNonAD()
+		ownCanonical := canonicalJID(ctx, c, *c.Store.ID)
+		candidate := jid.ToNonAD()
+		if candidate.User == own.User ||
+			(!ownCanonical.IsEmpty() && candidate.User == ownCanonical.User) {
+			if name := strings.TrimSpace(c.Store.PushName); name != "" {
+				return name
+			}
+		}
+	}
+	if name := deviceContactName(ctx, c, jid); name != "" {
+		return name
+	}
+	if name := contactPushName(ctx, c, jid); name != "" {
+		return name
+	}
+	return dialablePhone(ctx, c, jid)
+}
+
+// contactPushName returns the stored WhatsApp display name (pushName) for a
+// 1:1 JID, looking up both the JID as observed and its resolved phone form —
+// the mention-resolution counterpart of deviceContactName, which intentionally
+// excludes pushName.
+func contactPushName(ctx context.Context, c *whatsmeow.Client, jid types.JID) string {
+	if c == nil || c.Store == nil || c.Store.Contacts == nil {
+		return ""
+	}
+	candidates := []types.JID{jid.ToNonAD()}
+	if pn := phoneJID(ctx, c, jid); !pn.IsEmpty() && pn.String() != jid.ToNonAD().String() {
+		candidates = append(candidates, pn)
+	}
+	for _, candidate := range candidates {
+		if candidate.IsEmpty() {
+			continue
+		}
+		info, err := c.Store.Contacts.GetContact(ctx, candidate)
+		if err != nil || !info.Found {
+			continue
+		}
+		if name := strings.TrimSpace(info.PushName); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
 // toWaMessage maps a parsed whatsmeow message to the host payload shape. Only
 // ordinary direct chats and message-bearing @g.us groups are admitted.
 func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (waMessage, bool) {
@@ -820,6 +914,7 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 	if text == "" {
 		return waMessage{}, false
 	}
+	text = resolveMentionTokens(ctx, c, m.Message, text)
 	senderJID := canonicalParticipantJID(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	senderPhone := dialablePhoneFromPair(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	// whatsmeow computes IsFromMe for group messages by comparing the participant
