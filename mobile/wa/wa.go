@@ -76,6 +76,7 @@ func Capabilities() string {
 			"group_metadata_v1",
 			"groups_v1",
 			"list_groups_v1",
+			"reply_context_v1",
 			"stable_send_id",
 		},
 	})
@@ -739,6 +740,18 @@ type waMessage struct {
 	ChatPhoneNumber   string `json:"chatPhoneNumber"`
 	// The owner's saved address-book name for the chat counterparty, if any.
 	ContactName string `json:"contactName"`
+	// Reply context from ContextInfo, set when this message quotes another.
+	// QuotedMessageID is the quoted message's wire ID (joinable against a
+	// previously-synced MessageID); QuotedText is a short snippet of the quoted
+	// content shipped inline by the protocol, so it survives even when the
+	// original was never synced (pre-history media, deleted, ...).
+	QuotedMessageID  string `json:"quotedMessageID,omitempty"`
+	QuotedSenderJID  string `json:"quotedSenderJID,omitempty"`
+	QuotedSenderName string `json:"quotedSenderName,omitempty"`
+	QuotedText       string `json:"quotedText,omitempty"`
+	// True when the quoted message was the owner's own — the "someone replied
+	// to the user" signal. Resolved on-device, where the LID mappings live.
+	QuotedIsFromMe bool `json:"quotedIsFromMe,omitempty"`
 }
 
 type historySyncPayload struct {
@@ -799,6 +812,135 @@ func messageText(msg *waE2E.Message) string {
 		return ext.GetText()
 	}
 	return ""
+}
+
+// quotedSnippetMaxRunes caps the inline quoted-content snippet. WhatsApp's own
+// quote box renders only a preview; 300 runes is ample context and keeps a
+// hostile peer from inflating every reply with a full-size quoted payload.
+const quotedSnippetMaxRunes = 300
+
+// quoteContext carries the reply-to fields extracted from a reply's
+// ContextInfo. Zero value means "not a reply".
+type quoteContext struct {
+	messageID  string
+	senderJID  string
+	senderName string
+	text       string
+	isFromMe   bool
+}
+
+// extractQuoteContext pulls the quoted-message reference out of a reply.
+// Replies always arrive as ExtendedTextMessage (a plain Conversation message
+// can't carry ContextInfo), which is also the only shape messageText admits
+// beyond Conversation, so this never misses a message the pipeline keeps.
+func extractQuoteContext(ctx context.Context, c *whatsmeow.Client, msg *waE2E.Message) quoteContext {
+	info := msg.GetExtendedTextMessage().GetContextInfo()
+	if info == nil {
+		return quoteContext{}
+	}
+	stanzaID := info.GetStanzaID()
+	quoted := info.GetQuotedMessage()
+	if stanzaID == "" && quoted == nil {
+		return quoteContext{}
+	}
+	q := quoteContext{
+		messageID: stanzaID,
+		text:      quotedMessageSnippet(ctx, c, quoted),
+	}
+	if raw := info.GetParticipant(); raw != "" {
+		if jid, err := types.ParseJID(raw); err == nil && jid.User != "" {
+			q.senderJID = canonicalJID(ctx, c, jid).String()
+			q.senderName = mentionDisplayName(ctx, c, jid)
+			if c != nil && c.Store != nil && c.Store.ID != nil {
+				q.isFromMe = senderMatchesOwnIdentity(
+					jid,
+					types.JID{},
+					dialablePhone(ctx, c, jid),
+					c.Store.ID.ToNonAD(),
+					canonicalJID(ctx, c, *c.Store.ID),
+				)
+			}
+		}
+	}
+	return q
+}
+
+// unwrapQuotedMessage strips the FutureProofMessage envelopes (ephemeral,
+// view-once, captioned-document) a quoted message may arrive inside, so the
+// snippet reflects the actual content.
+func unwrapQuotedMessage(msg *waE2E.Message) *waE2E.Message {
+	for range 3 {
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
+// quotedMessageSnippet renders the inline copy of a quoted message as a short
+// single-line snippet: the text for text quotes, the caption (else a bracketed
+// kind marker) for media the text-only pipeline never stored.
+func quotedMessageSnippet(ctx context.Context, c *whatsmeow.Client, msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	msg = unwrapQuotedMessage(msg)
+	if t := messageText(msg); t != "" {
+		// The quoted message carries its own mention JIDs, so raw "@<digits>"
+		// tokens in the snippet resolve the same way live text does.
+		return normalizeQuotedSnippet(resolveMentionTokens(ctx, c, msg, t))
+	}
+	captionOr := func(caption string, fallback string) string {
+		if caption != "" {
+			return normalizeQuotedSnippet(caption)
+		}
+		return fallback
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return captionOr(msg.GetImageMessage().GetCaption(), "[photo]")
+	case msg.GetVideoMessage() != nil:
+		return captionOr(msg.GetVideoMessage().GetCaption(), "[video]")
+	case msg.GetAudioMessage() != nil:
+		if msg.GetAudioMessage().GetPTT() {
+			return "[voice message]"
+		}
+		return "[audio]"
+	case msg.GetStickerMessage() != nil:
+		return "[sticker]"
+	case msg.GetDocumentMessage() != nil:
+		return captionOr(msg.GetDocumentMessage().GetCaption(), "[document]")
+	case msg.GetLocationMessage() != nil, msg.GetLiveLocationMessage() != nil:
+		return "[location]"
+	case msg.GetContactMessage() != nil, msg.GetContactsArrayMessage() != nil:
+		return "[contact card]"
+	case msg.GetPollCreationMessage() != nil:
+		return captionOr(msg.GetPollCreationMessage().GetName(), "[poll]")
+	default:
+		// Unknown content still ships the stanza ID, so the reply stays
+		// attributable even without a snippet.
+		return ""
+	}
+}
+
+// normalizeQuotedSnippet collapses a quoted body onto one line and truncates
+// it, so a reply renders as a single readable history line downstream.
+func normalizeQuotedSnippet(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	runes := []rune(s)
+	if len(runes) <= quotedSnippetMaxRunes {
+		return s
+	}
+	return string(runes[:quotedSnippetMaxRunes]) + "…"
 }
 
 // resolveMentionTokens rewrites raw @-mention tokens into readable names.
@@ -915,6 +1057,7 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		return waMessage{}, false
 	}
 	text = resolveMentionTokens(ctx, c, m.Message, text)
+	quote := extractQuoteContext(ctx, c, m.Message)
 	senderJID := canonicalParticipantJID(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	senderPhone := dialablePhoneFromPair(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	// whatsmeow computes IsFromMe for group messages by comparing the participant
@@ -979,7 +1122,12 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 			}
 			return dialablePhone(ctx, c, m.Info.Chat)
 		}(),
-		ContactName: contactName,
+		ContactName:      contactName,
+		QuotedMessageID:  quote.messageID,
+		QuotedSenderJID:  quote.senderJID,
+		QuotedSenderName: quote.senderName,
+		QuotedText:       quote.text,
+		QuotedIsFromMe:   quote.isFromMe,
 	}, true
 }
 

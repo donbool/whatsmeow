@@ -336,6 +336,7 @@ func TestCapabilitiesAdvertiseOnlyImplementedFeatures(t *testing.T) {
 		"group_metadata_v1",
 		"groups_v1",
 		"list_groups_v1",
+		"reply_context_v1",
 		"stable_send_id",
 	}
 	if strings.Join(capabilities.Features, ",") != strings.Join(expected, ",") {
@@ -593,6 +594,143 @@ func TestResolveMentionTokensWithoutClient(t *testing.T) {
 		if got := resolveMentionTokens(ctx, nil, msg, messageText(msg)); got != text {
 			t.Fatalf("nil-client resolution must be a no-op, got %q from %q", got, text)
 		}
+	}
+}
+
+// A reply must ship who/what it quotes: the stanza ID (joinable against the
+// stored original), the quoted sender, and the inline snippet the protocol
+// carries for rendering the quote box.
+func TestToWaMessageExtractsQuoteContext(t *testing.T) {
+	resetGroupStateForTest()
+	group := types.NewJID("120363000000000011", types.GroupServer)
+	senderLID := types.NewJID("352000000000123", types.HiddenUserServer)
+	quotedPN := types.NewJID("15557654321", types.DefaultUserServer)
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{
+		quotedPN.String(): {Found: true, FullName: "Alice Doe"},
+	})
+
+	event := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    group,
+				Sender:  senderLID,
+				IsGroup: true,
+			},
+			ID:        "reply-message-1",
+			Timestamp: time.Unix(1_700_000_070, 0),
+		},
+		Message: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String("yeah let's do it"),
+				ContextInfo: &waE2E.ContextInfo{
+					StanzaID:    proto.String("original-message-9"),
+					Participant: proto.String(quotedPN.String()),
+					QuotedMessage: &waE2E.Message{
+						Conversation: proto.String("dinner at 8 on\nfriday?"),
+					},
+				},
+			},
+		},
+	}
+
+	message, ok := toWaMessage(context.Background(), client, event)
+	if !ok {
+		t.Fatal("expected reply text to be accepted")
+	}
+	if message.Text != "yeah let's do it" {
+		t.Fatalf("reply body must stay the message text, got %q", message.Text)
+	}
+	if message.QuotedMessageID != "original-message-9" {
+		t.Fatalf("expected quoted stanza ID, got %q", message.QuotedMessageID)
+	}
+	if message.QuotedSenderJID != quotedPN.String() {
+		t.Fatalf("expected quoted sender %q, got %q", quotedPN, message.QuotedSenderJID)
+	}
+	if message.QuotedSenderName != "Alice Doe" {
+		t.Fatalf("expected contact-resolved quoted sender name, got %q", message.QuotedSenderName)
+	}
+	if message.QuotedText != "dinner at 8 on friday?" {
+		t.Fatalf("expected single-line quoted snippet, got %q", message.QuotedText)
+	}
+	if message.QuotedIsFromMe {
+		t.Fatal("someone else's quoted message must not be marked own")
+	}
+}
+
+// Quoting the owner's own message is the "someone replied to the user" signal;
+// the device is the only place that can resolve it reliably.
+func TestExtractQuoteContextMarksOwnQuotedMessage(t *testing.T) {
+	ctx := context.Background()
+	ownPN := types.NewJID("15551234567", types.DefaultUserServer)
+	client := makeMentionResolutionClient(&ownPN, "Benji", map[string]types.ContactInfo{})
+
+	msg := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String("sounds good"),
+			ContextInfo: &waE2E.ContextInfo{
+				StanzaID:      proto.String("owners-message-1"),
+				Participant:   proto.String(ownPN.String()),
+				QuotedMessage: &waE2E.Message{Conversation: proto.String("free tonight?")},
+			},
+		},
+	}
+	quote := extractQuoteContext(ctx, client, msg)
+	if !quote.isFromMe {
+		t.Fatal("quote of the owner's message must be marked own")
+	}
+	if quote.senderName != "Benji" {
+		t.Fatalf("owner quote must resolve to own push name, got %q", quote.senderName)
+	}
+}
+
+// A message with no ContextInfo (or context without a quote) is not a reply.
+func TestExtractQuoteContextIgnoresNonReplies(t *testing.T) {
+	ctx := context.Background()
+	plain := &waE2E.Message{Conversation: proto.String("hello")}
+	if quote := extractQuoteContext(ctx, nil, plain); quote != (quoteContext{}) {
+		t.Fatalf("plain message must not produce quote context: %#v", quote)
+	}
+	mentionOnly := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("@15551234567 hi"),
+			ContextInfo: &waE2E.ContextInfo{MentionedJID: []string{"15551234567@s.whatsapp.net"}},
+		},
+	}
+	if quote := extractQuoteContext(ctx, nil, mentionOnly); quote != (quoteContext{}) {
+		t.Fatalf("mention-only context must not produce quote context: %#v", quote)
+	}
+}
+
+// Media quotes never made it into the text-only pipeline, so their snippet is
+// the caption when there is one and a bracketed kind marker otherwise.
+func TestQuotedMessageSnippetForMediaAndLength(t *testing.T) {
+	ctx := context.Background()
+	captioned := &waE2E.Message{
+		ImageMessage: &waE2E.ImageMessage{Caption: proto.String("us at the beach")},
+	}
+	if got := quotedMessageSnippet(ctx, nil, captioned); got != "us at the beach" {
+		t.Fatalf("captioned photo snippet = %q", got)
+	}
+	bare := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}
+	if got := quotedMessageSnippet(ctx, nil, bare); got != "[photo]" {
+		t.Fatalf("bare photo snippet = %q", got)
+	}
+	voice := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{PTT: proto.Bool(true)}}
+	if got := quotedMessageSnippet(ctx, nil, voice); got != "[voice message]" {
+		t.Fatalf("voice snippet = %q", got)
+	}
+	ephemeralText := &waE2E.Message{
+		EphemeralMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{Conversation: proto.String("wrapped text")},
+		},
+	}
+	if got := quotedMessageSnippet(ctx, nil, ephemeralText); got != "wrapped text" {
+		t.Fatalf("ephemeral-wrapped snippet = %q", got)
+	}
+	long := &waE2E.Message{Conversation: proto.String(strings.Repeat("a", 400))}
+	got := quotedMessageSnippet(ctx, nil, long)
+	if len([]rune(got)) != quotedSnippetMaxRunes+1 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("long snippet must truncate to %d runes + ellipsis, got %d runes", quotedSnippetMaxRunes, len([]rune(got)))
 	}
 }
 
