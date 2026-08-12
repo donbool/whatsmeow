@@ -76,6 +76,7 @@ func Capabilities() string {
 			"group_metadata_v1",
 			"groups_v1",
 			"list_groups_v1",
+			"media_caption_v1",
 			"reply_context_v1",
 			"stable_send_id",
 		},
@@ -423,7 +424,7 @@ func sendText(recipient string, text string, messageID string) error {
 	// never appear in the chat. The server-assigned ID lets the host dedupe this
 	// against any later history-sync copy of the same message.
 	echoChatJID := canonicalJID(ctx, c, jid)
-	emitSentMessage(ctx, c, echoChatJID, string(resp.ID), text, resp.Timestamp)
+	emitSentMessage(ctx, c, echoChatJID, string(resp.ID), text, "", resp.Timestamp)
 	return nil
 }
 
@@ -503,13 +504,18 @@ func SendImageURL(recipient string, mediaURL string, caption string) error {
 	// Echo the send so it surfaces in the host chat, same as SendText. Media
 	// echoes don't carry the image yet, so show the caption (or a photo marker)
 	// to reflect that something was sent. The server-assigned ID lets the host
-	// dedupe this against any later history-sync copy.
+	// dedupe this against any later history-sync copy. A captioned send ships
+	// mediaType "image" so it renders the same as a captured captioned photo;
+	// a captionless one keeps the plain-text placeholder (no mediaType, or the
+	// backend would prefix the placeholder with a redundant marker).
 	echoText := caption
+	echoMediaType := "image"
 	if echoText == "" {
 		echoText = "\U0001F4F7 Photo"
+		echoMediaType = ""
 	}
 	echoChatJID := canonicalJID(ctx, c, jid)
-	emitSentMessage(ctx, c, echoChatJID, string(resp.ID), echoText, resp.Timestamp)
+	emitSentMessage(ctx, c, echoChatJID, string(resp.ID), echoText, echoMediaType, resp.Timestamp)
 	return nil
 }
 
@@ -723,12 +729,16 @@ func teardownLocked() {
 // counterparty. The host uses the phone to unify a chat with an existing contact
 // and the contact name to label it, instead of surfacing the opaque LID id.
 type waMessage struct {
-	ChatJID        string `json:"chatJID"`
-	SenderJID      string `json:"senderJID"`
-	SenderAltJID   string `json:"senderAltJID,omitempty"`
-	MessageID      string `json:"messageID"`
-	TimestampSecs  int64  `json:"timestampSecs"`
-	Text           string `json:"text"`
+	ChatJID       string `json:"chatJID"`
+	SenderJID     string `json:"senderJID"`
+	SenderAltJID  string `json:"senderAltJID,omitempty"`
+	MessageID     string `json:"messageID"`
+	TimestampSecs int64  `json:"timestampSecs"`
+	Text          string `json:"text"`
+	// Set when Text is a media caption rather than a standalone text message:
+	// "image", "gif", "video", or "document" (media_caption_v1). The media
+	// itself is not ingested — the caption is the retained context.
+	MediaType      string `json:"mediaType,omitempty"`
 	PushName       string `json:"pushName"`
 	ChatType       string `json:"chatType"`
 	ChatName       string `json:"chatName,omitempty"`
@@ -798,9 +808,9 @@ type waGroupMetadata struct {
 }
 
 // messageText pulls plain text out of a message, covering both simple
-// conversation messages and extended (link/quote) text. Non-text messages
-// (media, stickers, reactions, ...) return "" and are skipped while scope is
-// text-only.
+// conversation messages and extended (link/quote) text. Media captions are
+// intentionally excluded here (quoting renders them itself); the ingestion
+// pipeline uses messageContent, which admits them.
 func messageText(msg *waE2E.Message) string {
 	if msg == nil {
 		return ""
@@ -812,6 +822,61 @@ func messageText(msg *waE2E.Message) string {
 		return ext.GetText()
 	}
 	return ""
+}
+
+// messageContent extracts the ingestible text of a message along with the kind
+// of media it was attached to ("" for standalone text). WhatsApp carries
+// captions inline on image/video/document messages (media_caption_v1), so a
+// captioned photo ships its caption as the message text instead of being
+// dropped. Captionless media still yields "" and is skipped — the media bytes
+// themselves are out of scope. Stickers, audio, and voice notes carry no
+// caption in the protocol.
+func messageContent(msg *waE2E.Message) (text string, mediaType string) {
+	if msg == nil {
+		return "", ""
+	}
+	if t := messageText(msg); t != "" {
+		return t, ""
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption(), "image"
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		// WhatsApp GIFs are videos with GifPlayback; naming them lets the
+		// backend render "[GIF]" instead of the misleading "[video]".
+		if vid.GetGifPlayback() {
+			return vid.GetCaption(), "gif"
+		}
+		return vid.GetCaption(), "video"
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption(), "document"
+	}
+	return "", ""
+}
+
+// messageContextInfo returns the ContextInfo carried by whichever admitted
+// shape the message is: plain Conversation text has none; extended text and
+// captioned media each carry their own. Mentions and reply context must be
+// read from here — a captioned photo that replies to (or mentions) someone
+// stores that context on the ImageMessage, not on an ExtendedTextMessage.
+func messageContextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return ext.GetContextInfo()
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetContextInfo()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetContextInfo()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetContextInfo()
+	}
+	return nil
 }
 
 // quotedSnippetMaxRunes caps the inline quoted-content snippet. WhatsApp's own
@@ -829,12 +894,13 @@ type quoteContext struct {
 	isFromMe   bool
 }
 
-// extractQuoteContext pulls the quoted-message reference out of a reply.
-// Replies always arrive as ExtendedTextMessage (a plain Conversation message
-// can't carry ContextInfo), which is also the only shape messageText admits
-// beyond Conversation, so this never misses a message the pipeline keeps.
+// extractQuoteContext pulls the quoted-message reference out of a reply. A
+// plain Conversation message can't carry ContextInfo; extended text and
+// captioned media (which can also be sent as replies) each carry their own,
+// so the lookup goes through messageContextInfo and never misses a shape the
+// pipeline keeps.
 func extractQuoteContext(ctx context.Context, c *whatsmeow.Client, msg *waE2E.Message) quoteContext {
-	info := msg.GetExtendedTextMessage().GetContextInfo()
+	info := messageContextInfo(msg)
 	if info == nil {
 		return quoteContext{}
 	}
@@ -953,7 +1019,7 @@ func normalizeQuotedSnippet(s string) string {
 // rewrite happens here, at capture. Tokens that resolve to no name are left
 // untouched rather than degraded.
 func resolveMentionTokens(ctx context.Context, c *whatsmeow.Client, msg *waE2E.Message, text string) string {
-	mentioned := msg.GetExtendedTextMessage().GetContextInfo().GetMentionedJID()
+	mentioned := messageContextInfo(msg).GetMentionedJID()
 	if len(mentioned) == 0 || !strings.ContainsRune(text, '@') {
 		return text
 	}
@@ -1052,7 +1118,14 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 	if chatType == "group" && (m.IsEphemeral || m.IsViewOnce || m.IsEdit) {
 		return waMessage{}, false
 	}
-	text := messageText(m.Message)
+	// View-once content is designed to disappear after a single viewing;
+	// retaining its caption would defeat that expectation, so it is dropped in
+	// every chat type. (Before captions were admitted this was implicit:
+	// view-once is always media, and media always extracted to "".)
+	if m.IsViewOnce {
+		return waMessage{}, false
+	}
+	text, mediaType := messageContent(m.Message)
 	if text == "" {
 		return waMessage{}, false
 	}
@@ -1110,6 +1183,7 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		MessageID:         string(m.Info.ID),
 		TimestampSecs:     m.Info.Timestamp.Unix(),
 		Text:              text,
+		MediaType:         mediaType,
 		PushName:          m.Info.PushName,
 		ChatType:          chatType,
 		ChatName:          chatName,
@@ -1368,7 +1442,15 @@ func supportedSendJID(jid types.JID) bool {
 // returns), so the host attributes it to the owner; it also carries the
 // server-assigned id+timestamp so a later history-sync copy dedupes against it
 // instead of duplicating.
-func emitSentMessage(ctx context.Context, c *whatsmeow.Client, chat types.JID, id string, text string, ts time.Time) {
+func emitSentMessage(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	chat types.JID,
+	id string,
+	text string,
+	mediaType string,
+	ts time.Time,
+) {
 	evt := getEvt()
 	if evt == nil || c.Store == nil || c.Store.ID == nil {
 		return
@@ -1382,6 +1464,7 @@ func emitSentMessage(ctx context.Context, c *whatsmeow.Client, chat types.JID, i
 		MessageID:     id,
 		TimestampSecs: ts.Unix(),
 		Text:          text,
+		MediaType:     mediaType,
 		PushName:      c.Store.PushName,
 		ChatType: func() string {
 			if chat.Server == types.GroupServer {

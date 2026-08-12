@@ -336,6 +336,7 @@ func TestCapabilitiesAdvertiseOnlyImplementedFeatures(t *testing.T) {
 		"group_metadata_v1",
 		"groups_v1",
 		"list_groups_v1",
+		"media_caption_v1",
 		"reply_context_v1",
 		"stable_send_id",
 	}
@@ -731,6 +732,188 @@ func TestQuotedMessageSnippetForMediaAndLength(t *testing.T) {
 	got := quotedMessageSnippet(ctx, nil, long)
 	if len([]rune(got)) != quotedSnippetMaxRunes+1 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("long snippet must truncate to %d runes + ellipsis, got %d runes", quotedSnippetMaxRunes, len([]rune(got)))
+	}
+}
+
+// Captioned media ships its caption as the message text with the media kind
+// alongside; captionless media stays dropped (the caption is the retained
+// context, the bytes are out of scope).
+func TestToWaMessageIngestsMediaCaptions(t *testing.T) {
+	resetGroupStateForTest()
+	friend := types.NewJID("15557654321", types.DefaultUserServer)
+	directInfo := types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     friend,
+			Sender:   friend,
+			IsGroup:  false,
+			IsFromMe: false,
+		},
+		ID:        "media-caption-1",
+		Timestamp: time.Unix(1_700_000_080, 0),
+	}
+
+	cases := []struct {
+		name          string
+		message       *waE2E.Message
+		wantText      string
+		wantMediaType string
+	}{
+		{
+			"captioned photo",
+			&waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("us at the beach")}},
+			"us at the beach",
+			"image",
+		},
+		{
+			"captioned video",
+			&waE2E.Message{VideoMessage: &waE2E.VideoMessage{Caption: proto.String("wait for it")}},
+			"wait for it",
+			"video",
+		},
+		{
+			"captioned gif",
+			&waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+				Caption:     proto.String("mood"),
+				GifPlayback: proto.Bool(true),
+			}},
+			"mood",
+			"gif",
+		},
+		{
+			"captioned document",
+			&waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{Caption: proto.String("signed lease")}},
+			"signed lease",
+			"document",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event := &events.Message{Info: directInfo, Message: tc.message}
+			message, ok := toWaMessage(context.Background(), nil, event)
+			if !ok {
+				t.Fatal("expected captioned media to be accepted")
+			}
+			if message.Text != tc.wantText {
+				t.Fatalf("Text = %q, want %q", message.Text, tc.wantText)
+			}
+			if message.MediaType != tc.wantMediaType {
+				t.Fatalf("MediaType = %q, want %q", message.MediaType, tc.wantMediaType)
+			}
+		})
+	}
+
+	// Plain text must not gain a media type.
+	plain, ok := toWaMessage(context.Background(), nil, makeTextEvent(directInfo, "hello"))
+	if !ok || plain.MediaType != "" {
+		t.Fatalf("plain text must have no media type, got %q (ok=%v)", plain.MediaType, ok)
+	}
+
+	dropped := []struct {
+		name  string
+		event *events.Message
+	}{
+		{
+			"captionless photo",
+			&events.Message{Info: directInfo, Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}},
+		},
+		{
+			"sticker",
+			&events.Message{Info: directInfo, Message: &waE2E.Message{StickerMessage: &waE2E.StickerMessage{}}},
+		},
+		{
+			"voice note",
+			&events.Message{Info: directInfo, Message: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{PTT: proto.Bool(true)}}},
+		},
+	}
+	for _, tc := range dropped {
+		if _, ok := toWaMessage(context.Background(), nil, tc.event); ok {
+			t.Fatalf("expected %s to be dropped", tc.name)
+		}
+	}
+}
+
+// View-once content is designed to disappear after one viewing; its caption
+// must never be retained, in direct chats as well as groups.
+func TestToWaMessageRejectsViewOnceCaptionedMedia(t *testing.T) {
+	friend := types.NewJID("15557654321", types.DefaultUserServer)
+	event := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     friend,
+				Sender:   friend,
+				IsGroup:  false,
+				IsFromMe: false,
+			},
+			ID:        "view-once-1",
+			Timestamp: time.Unix(1_700_000_081, 0),
+		},
+		Message: &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{Caption: proto.String("delete after reading")},
+		},
+	}
+	event.IsViewOnce = true
+	if _, ok := toWaMessage(context.Background(), nil, event); ok {
+		t.Fatal("expected view-once captioned media to be rejected in a direct chat")
+	}
+}
+
+// A captioned photo carries mention and reply context on the ImageMessage's
+// own ContextInfo (there is no ExtendedTextMessage wrapper); both must resolve
+// exactly as they do for text replies.
+func TestToWaMessageResolvesCaptionMentionsAndQuotes(t *testing.T) {
+	resetGroupStateForTest()
+	group := types.NewJID("120363000000000012", types.GroupServer)
+	senderLID := types.NewJID("352000000000123", types.HiddenUserServer)
+	bolajiLID := types.NewJID("248506975531090", types.HiddenUserServer)
+	quotedPN := types.NewJID("15557654321", types.DefaultUserServer)
+	client := makeMentionResolutionClient(nil, "", map[string]types.ContactInfo{
+		bolajiLID.String(): {Found: true, PushName: "Bolaji"},
+		quotedPN.String():  {Found: true, FullName: "Alice Doe"},
+	})
+
+	event := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    group,
+				Sender:  senderLID,
+				IsGroup: true,
+			},
+			ID:        "caption-context-1",
+			Timestamp: time.Unix(1_700_000_082, 0),
+		},
+		Message: &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption: proto.String("@248506975531090 this is the spot"),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{bolajiLID.String()},
+					StanzaID:     proto.String("original-message-12"),
+					Participant:  proto.String(quotedPN.String()),
+					QuotedMessage: &waE2E.Message{
+						Conversation: proto.String("where should we meet?"),
+					},
+				},
+			},
+		},
+	}
+
+	message, ok := toWaMessage(context.Background(), client, event)
+	if !ok {
+		t.Fatal("expected captioned media reply to be accepted")
+	}
+	if message.Text != "@Bolaji this is the spot" {
+		t.Fatalf("expected resolved mention in caption, got %q", message.Text)
+	}
+	if message.MediaType != "image" {
+		t.Fatalf("MediaType = %q, want image", message.MediaType)
+	}
+	if message.QuotedMessageID != "original-message-12" {
+		t.Fatalf("expected quoted stanza ID, got %q", message.QuotedMessageID)
+	}
+	if message.QuotedSenderName != "Alice Doe" {
+		t.Fatalf("expected resolved quoted sender name, got %q", message.QuotedSenderName)
+	}
+	if message.QuotedText != "where should we meet?" {
+		t.Fatalf("expected quoted snippet, got %q", message.QuotedText)
 	}
 }
 
