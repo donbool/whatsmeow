@@ -84,6 +84,10 @@ fi
 if [[ -x "${HOME}/.bun/bin/bun" ]]; then
   authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bun" "bun-${HONO_BUN}"
 fi
+if [[ -e "${HOME}/.bun/bin/bunx" ]]; then
+  authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bunx" "bunx"
+  authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bunx" "bunx-${HONO_BUN}"
+fi
 
 bash "$WHATSMEOW_ROOT/scripts/cloud/verify-env.sh"
 
