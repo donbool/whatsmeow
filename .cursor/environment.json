@@ -1,0 +1,14 @@
+{
+  "name": "authintel",
+  "install": "bash scripts/cloud/install.sh",
+  "start": "bash scripts/cloud/start.sh",
+  "repositoryDependencies": [
+    "github.com/Authentic-Intelligence/auraRN",
+    "github.com/clarkg-org/aura-hono-api"
+  ],
+  "ports": [
+    { "name": "Hono API", "port": 3000 },
+    { "name": "Admin Tool", "port": 3100 },
+    { "name": "Redis", "port": 6379 }
+  ]
+}
