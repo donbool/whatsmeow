@@ -58,8 +58,16 @@ echo "[cloud-install] Installing whatsmeow (Go)."
 bash "$WHATSMEOW_ROOT/scripts/cloud/install-go.sh"
 
 # --- aura-hono-api last so its bun + ~/.local/bin persist win the default ----
-# Requires Cursor secrets AURADB_EDGEDB_DSN and INSTANT_APP_ADMIN_TOKEN.
-echo "[cloud-install] Installing aura-hono-api."
+# Full codegen + verify:env need AURADB_EDGEDB_DSN and INSTANT_APP_ADMIN_TOKEN.
+# Builds often do not inject those (user-scoped secrets are agent-runtime
+# only). The sibling install then does toolchains + lockfile deps only;
+# start.sh generates artifacts when an agent later has the secrets.
+echo "[cloud-install] Installing sibling API repo at $HONO."
+if [[ -n "${AURADB_EDGEDB_DSN:-}" && -n "${INSTANT_APP_ADMIN_TOKEN:-}" ]]; then
+  echo "[cloud-install] Sibling API secrets present in this process (full install including codegen + verify:env)."
+else
+  echo "[cloud-install] Sibling API secrets not injected into this Build (AURADB_EDGEDB_DSN and/or INSTANT_APP_ADMIN_TOKEN empty). User-scoped secrets are agent-runtime only. Install will do deps only."
+fi
 bash "$HONO/scripts/cloud/install.sh"
 
 # --- Re-assert versioned bun shims on Cloud's reset PATH ---------------------
