@@ -16,6 +16,7 @@ package wa
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +51,16 @@ const wrapperSchemaVersion = 1
 // so we can detect (and reject) anything larger instead of streaming forever.
 const maxOutboundMediaBytes = 16 * 1024 * 1024
 
+// maxInboundImageBytes bounds a received photo before it is base64-encoded
+// into the sync payload (inbound_media_image_v1). WhatsApp's standard image
+// pipeline re-encodes well under this; a rare larger original degrades to the
+// pre-media behavior (caption only) instead of ballooning the upload.
+const maxInboundImageBytes = 6 * 1024 * 1024
+
+// inboundImageDownloadTimeout caps one inbound media fetch so a stalled CDN
+// read can't wedge the event handler goroutine.
+const inboundImageDownloadTimeout = 45 * time.Second
+
 // Set by mobile/build-ios.sh so a shipped framework can be traced back to the
 // exact source and gomobile toolchain that produced it.
 var (
@@ -75,8 +86,10 @@ func Capabilities() string {
 		Features: []string{
 			"group_metadata_v1",
 			"groups_v1",
+			"inbound_media_image_v1",
 			"list_groups_v1",
 			"media_caption_v1",
+			"reactions_v1",
 			"reply_context_v1",
 			"stable_send_id",
 		},
@@ -90,6 +103,10 @@ func Capabilities() string {
 // responsible for dispatching to the main thread before touching UI.
 type Events interface {
 	OnConnected()
+	// OnDisconnected fires when the websocket drops (whatsmeow auto-reconnects)
+	// or the stream is replaced by another client. It says nothing about the
+	// pairing state — the host uses it to render live connection status.
+	OnDisconnected()
 	OnLoggedOut()
 	OnPairSuccess()
 	// OnMessage delivers a single live message as a JSON object (see waMessage).
@@ -762,6 +779,18 @@ type waMessage struct {
 	// True when the quoted message was the owner's own — the "someone replied
 	// to the user" signal. Resolved on-device, where the LID mappings live.
 	QuotedIsFromMe bool `json:"quotedIsFromMe,omitempty"`
+	// Kind discriminates payloads that are not ordinary messages. Empty for a
+	// normal message; "reaction" (reactions_v1) for an emoji reaction, where
+	// Text carries the emoji ("" = the sender removed their reaction) and
+	// TargetMessageID names the message it applies to.
+	Kind            string `json:"kind,omitempty"`
+	TargetMessageID string `json:"targetMessageID,omitempty"`
+	// Inbound photo bytes (inbound_media_image_v1): the downloaded, decrypted
+	// image as base64, set only for live image messages within the size cap.
+	// The host ships it to the backend, which stores the file and strips the
+	// bytes before anything else sees the payload.
+	MediaBase64   string `json:"mediaBase64,omitempty"`
+	MediaMimeType string `json:"mediaMimeType,omitempty"`
 }
 
 type historySyncPayload struct {
@@ -1103,9 +1132,23 @@ func contactPushName(ctx context.Context, c *whatsmeow.Client, jid types.JID) st
 	return ""
 }
 
-// toWaMessage maps a parsed whatsmeow message to the host payload shape. Only
-// ordinary direct chats and message-bearing @g.us groups are admitted.
+// toWaMessage maps a parsed whatsmeow message to the host payload shape with
+// history semantics (no media download). Only ordinary direct chats and
+// message-bearing @g.us groups are admitted.
 func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (waMessage, bool) {
+	return toWaMessageOpts(ctx, c, m, false)
+}
+
+// toWaMessageOpts is toWaMessage with the live/history split made explicit:
+// includeMedia downloads inbound image bytes (live dispatch only — history
+// blobs can carry hundreds of photos whose media keys are often expired, so
+// backfill keeps the caption-only behavior).
+func toWaMessageOpts(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	m *events.Message,
+	includeMedia bool,
+) (waMessage, bool) {
 	if m == nil {
 		return waMessage{}, false
 	}
@@ -1125,12 +1168,40 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 	if m.IsViewOnce {
 		return waMessage{}, false
 	}
-	text, mediaType := messageContent(m.Message)
-	if text == "" {
-		return waMessage{}, false
+	var (
+		kind            string
+		targetMessageID string
+		text            string
+		mediaType       string
+		mediaBase64     string
+		mediaMimeType   string
+		quote           quoteContext
+	)
+	if reaction := m.Message.GetReactionMessage(); reaction != nil {
+		// A reaction is an ordinary events.Message whose content is a
+		// ReactionMessage naming the target by wire ID. Text carries the emoji;
+		// an empty Text means the sender removed their reaction, so the payload
+		// is admitted with empty text (unlike normal messages). Mentions and
+		// quote context do not apply.
+		targetMessageID = reaction.GetKey().GetID()
+		if targetMessageID == "" {
+			return waMessage{}, false
+		}
+		kind = "reaction"
+		text = reaction.GetText()
+	} else {
+		text, mediaType = messageContent(m.Message)
+		if includeMedia && mediaType == "image" {
+			mediaBase64, mediaMimeType = downloadInboundImage(ctx, c, m.Message.GetImageMessage())
+		}
+		// A captionless photo is only worth shipping when its bytes came along;
+		// captionless video/document/sticker content stays dropped as before.
+		if text == "" && mediaBase64 == "" {
+			return waMessage{}, false
+		}
+		text = resolveMentionTokens(ctx, c, m.Message, text)
+		quote = extractQuoteContext(ctx, c, m.Message)
 	}
-	text = resolveMentionTokens(ctx, c, m.Message, text)
-	quote := extractQuoteContext(ctx, c, m.Message)
 	senderJID := canonicalParticipantJID(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	senderPhone := dialablePhoneFromPair(ctx, c, m.Info.Sender, m.Info.SenderAlt)
 	// whatsmeow computes IsFromMe for group messages by comparing the participant
@@ -1202,7 +1273,54 @@ func toWaMessage(ctx context.Context, c *whatsmeow.Client, m *events.Message) (w
 		QuotedSenderName: quote.senderName,
 		QuotedText:       quote.text,
 		QuotedIsFromMe:   quote.isFromMe,
+		Kind:             kind,
+		TargetMessageID:  targetMessageID,
+		MediaBase64:      mediaBase64,
+		MediaMimeType:    mediaMimeType,
 	}, true
+}
+
+// downloadInboundImage fetches and decrypts a received photo's bytes, bounded
+// by size and time, and returns them base64-encoded with a resolved image MIME
+// type. Every failure degrades to ("", "") — the message then ships exactly as
+// it did before media ingestion existed (caption only, or dropped when bare).
+func downloadInboundImage(
+	ctx context.Context,
+	c *whatsmeow.Client,
+	img *waE2E.ImageMessage,
+) (string, string) {
+	if c == nil || img == nil {
+		return "", ""
+	}
+	if img.GetFileLength() > maxInboundImageBytes {
+		c.Log.Infof(
+			"Skipping inbound image download: %d bytes exceeds %d cap",
+			img.GetFileLength(), maxInboundImageBytes,
+		)
+		return "", ""
+	}
+	dlCtx, cancel := context.WithTimeout(ctx, inboundImageDownloadTimeout)
+	defer cancel()
+	data, err := c.Download(dlCtx, img)
+	if err != nil {
+		c.Log.Warnf("Failed to download inbound image: %v", err)
+		return "", ""
+	}
+	if len(data) == 0 || len(data) > maxInboundImageBytes {
+		return "", ""
+	}
+	mimeType := strings.TrimSpace(img.GetMimetype())
+	if i := strings.IndexByte(mimeType, ';'); i >= 0 {
+		mimeType = strings.TrimSpace(mimeType[:i])
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		// Missing or bogus wire MIME type: sniff the decrypted bytes.
+		mimeType = http.DetectContentType(data)
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return "", ""
+	}
+	return base64.StdEncoding.EncodeToString(data), mimeType
 }
 
 // senderMatchesOwnIdentity reports whether a message's sender resolves to this
@@ -1499,12 +1617,21 @@ func dispatch(ctx context.Context, c *whatsmeow.Client, evt Events, raw interfac
 	switch e := raw.(type) {
 	case *events.Connected:
 		evt.OnConnected()
+	case *events.Disconnected:
+		// whatsmeow reconnects on its own; the host only needs the signal so
+		// "Connected" status can reflect the actual socket, not pairing state.
+		evt.OnDisconnected()
+	case *events.StreamReplaced:
+		// Another client took over the stream; whatsmeow will not reconnect on
+		// its own here, so the host must know the connection is gone.
+		evt.OnDisconnected()
 	case *events.PairSuccess:
 		evt.OnPairSuccess()
 	case *events.LoggedOut:
 		evt.OnLoggedOut()
 	case *events.Message:
-		msg, ok := toWaMessage(ctx, c, e)
+		// Live messages carry inbound photo bytes (history backfill does not).
+		msg, ok := toWaMessageOpts(ctx, c, e, true)
 		if !ok {
 			return
 		}

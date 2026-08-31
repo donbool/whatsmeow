@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
@@ -232,6 +233,97 @@ func TestToWaMessageRejectsUnsupportedAndExpiringGroupContent(t *testing.T) {
 	}
 }
 
+func makeReactionEvent(info types.MessageInfo, targetID string, emoji string) *events.Message {
+	return &events.Message{
+		Info: info,
+		Message: &waE2E.Message{
+			ReactionMessage: &waE2E.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(info.Chat.String()),
+					ID:        proto.String(targetID),
+				},
+				Text: proto.String(emoji),
+			},
+		},
+	}
+}
+
+// Reactions ship as kind "reaction" with the emoji in Text and the reacted-to
+// message's wire ID in TargetMessageID; an empty emoji (reaction removed) is
+// still admitted, and a reaction without a target is dropped.
+func TestToWaMessageExtractsReactions(t *testing.T) {
+	friend := types.NewJID("15557654321", types.DefaultUserServer)
+	info := types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     friend,
+			Sender:   friend,
+			IsGroup:  false,
+			IsFromMe: false,
+		},
+		ID:        "reaction-1",
+		Timestamp: time.Unix(1_700_000_010, 0),
+		PushName:  "Alice",
+	}
+
+	message, ok := toWaMessage(context.Background(), nil, makeReactionEvent(info, "target-42", "❤️"))
+	if !ok {
+		t.Fatal("expected reaction to be accepted")
+	}
+	if message.Kind != "reaction" {
+		t.Fatalf("expected kind reaction, got %q", message.Kind)
+	}
+	if message.TargetMessageID != "target-42" {
+		t.Fatalf("expected target message id, got %q", message.TargetMessageID)
+	}
+	if message.Text != "❤️" {
+		t.Fatalf("expected emoji text, got %q", message.Text)
+	}
+	if message.MessageID != "reaction-1" {
+		t.Fatalf("reaction must keep its own wire id, got %q", message.MessageID)
+	}
+
+	removal, ok := toWaMessage(context.Background(), nil, makeReactionEvent(info, "target-42", ""))
+	if !ok {
+		t.Fatal("expected reaction removal (empty emoji) to be accepted")
+	}
+	if removal.Kind != "reaction" || removal.Text != "" {
+		t.Fatalf("expected empty-text reaction removal, got kind=%q text=%q", removal.Kind, removal.Text)
+	}
+
+	if _, ok := toWaMessage(context.Background(), nil, makeReactionEvent(info, "", "❤️")); ok {
+		t.Fatal("expected reaction without a target id to be dropped")
+	}
+}
+
+// The bare-media drop only relaxes when image bytes actually came along:
+// history semantics (no media download) still drop a captionless photo.
+func TestToWaMessageStillDropsCaptionlessImageWithoutBytes(t *testing.T) {
+	friend := types.NewJID("15557654321", types.DefaultUserServer)
+	event := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     friend,
+				Sender:   friend,
+				IsGroup:  false,
+				IsFromMe: false,
+			},
+			ID:        "bare-photo-1",
+			Timestamp: time.Unix(1_700_000_011, 0),
+		},
+		Message: &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg")},
+		},
+	}
+	if _, ok := toWaMessage(context.Background(), nil, event); ok {
+		t.Fatal("expected captionless image without downloaded bytes to be dropped")
+	}
+	// The live path degrades identically when the download yields nothing
+	// (nil client here, so downloadInboundImage returns empty).
+	if _, ok := toWaMessageOpts(context.Background(), nil, event, true); ok {
+		t.Fatal("expected captionless image with failed download to be dropped")
+	}
+}
+
 func TestCanonicalParticipantPrefersExplicitLIDAlternate(t *testing.T) {
 	pn := types.NewJID("15551234567", types.DefaultUserServer)
 	lid := types.NewJID("777777777", types.HiddenUserServer)
@@ -335,8 +427,10 @@ func TestCapabilitiesAdvertiseOnlyImplementedFeatures(t *testing.T) {
 	expected := []string{
 		"group_metadata_v1",
 		"groups_v1",
+		"inbound_media_image_v1",
 		"list_groups_v1",
 		"media_caption_v1",
+		"reactions_v1",
 		"reply_context_v1",
 		"stable_send_id",
 	}
