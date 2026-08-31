@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Shared paths for the authintel multi-repo cloud environment.
 # This file lives in whatsmeow (the repo that holds .cursor/environment.json).
-# Cursor clones the three repos as siblings; workspace root is whatsmeow's parent:
-#   <workspace>/auraRN/
-#   <workspace>/aura-hono-api/
-#   <workspace>/whatsmeow/     ← this repo
+# Cursor clones the two repos as siblings; workspace root is whatsmeow's parent:
+#   <workspace>/megpt-mono/            ← MeGPT monorepo (auraRN + aura-hono-api)
+#   <workspace>/whatsmeow/             ← this repo
 #
 # Cursor Cloud's reset default PATH:
 #   $HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -13,12 +12,11 @@ WHATSMEOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AUTHINTEL_WORKSPACE="$(cd "$WHATSMEOW_ROOT/.." && pwd)"
 CLOUD_DEFAULT_PATH="${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-AUTHINTEL_REPOS=(auraRN aura-hono-api whatsmeow)
+AUTHINTEL_REPOS=(megpt-mono whatsmeow)
 
 authintel_repo_url() {
   case "$1" in
-    auraRN) echo "https://github.com/Authentic-Intelligence/auraRN.git" ;;
-    aura-hono-api) echo "https://github.com/clarkg-org/aura-hono-api.git" ;;
+    megpt-mono) echo "https://github.com/Authentic-Intelligence/megpt-mono.git" ;;
     whatsmeow) echo "https://github.com/donbool/whatsmeow.git" ;;
     *)
       echo "unknown repo: $1" >&2
@@ -30,19 +28,25 @@ authintel_repo_url() {
 authintel_repo_path() {
   case "$1" in
     whatsmeow) echo "$WHATSMEOW_ROOT" ;;
-    *) echo "${AUTHINTEL_WORKSPACE}/$1" ;;
+    megpt-mono) echo "${AUTHINTEL_WORKSPACE}/megpt-mono" ;;
+    auraRN) echo "${AUTHINTEL_WORKSPACE}/megpt-mono/auraRN" ;;
+    aura-hono-api) echo "${AUTHINTEL_WORKSPACE}/megpt-mono/aura-hono-api" ;;
+    *)
+      echo "unknown repo: $1" >&2
+      return 1
+      ;;
   esac
 }
 
-# True when this checkout is sitting next to the other product repos (the
-# multi-repo Cloud layout, or a local authintel/ folder). A whatsmeow-only
-# clone has neither sibling and should not try to install them.
+# True when this checkout is sitting next to megpt-mono (the multi-repo Cloud
+# layout, or a local authintel/ folder). A whatsmeow-only clone has no sibling
+# and should not try to install it.
 authintel_has_workspace_siblings() {
-  [[ -d "$(authintel_repo_path auraRN)" || -d "$(authintel_repo_path aura-hono-api)" ]]
+  [[ -d "$(authintel_repo_path megpt-mono)" ]]
 }
 
 authintel_read_bun_pin() {
-  sed -n 's/.*"packageManager": *"bun@\([0-9A-Za-z.-]*\)".*/\1/p' "$1/package.json"
+  sed -n 's/.*"packageManager": *"bun@\([0-9A-Za-z.-]*\)".*/\1/p' "$1/package.json" | head -n 1
 }
 
 authintel_read_go_toolchain() {

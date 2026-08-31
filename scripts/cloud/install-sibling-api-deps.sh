@@ -1,35 +1,38 @@
 #!/usr/bin/env bash
-# Secretless sibling-API bootstrap for Cursor Cloud Builds.
+# Secretless megpt-mono backend bootstrap for Cursor Cloud Builds.
 #
-# The sibling API install.sh fail-closes when AURADB_EDGEDB_DSN or
-# INSTANT_APP_ADMIN_TOKEN is unset. Cursor Builds do not inject user-scoped
-# secrets (https://cursor.com/docs/cloud-agent/builds), so calling that
-# script from install-workspace.sh kills every recurring Build.
+# megpt-mono's install.sh fail-closes when AURADB_EDGEDB_DSN or
+# INSTANT_APP_ADMIN_TOKEN is unset (it runs aura-hono-api/scripts/cloud/install.sh
+# first). Cursor Builds do not inject user-scoped secrets
+# (https://cursor.com/docs/cloud-agent/builds), so calling that script from
+# install-workspace.sh kills every recurring Build.
 #
-# This script lives in whatsmeow and does not modify the sibling repo. It
-# installs the sibling's pinned Bun, Redis, and lockfile deps only — no
-# Gel codegen, no verify:env, no local Gel instance.
+# This script lives in whatsmeow and does not modify megpt-mono. It installs
+# the monorepo's pinned Bun, Redis, and aura-hono-api lockfile deps only — no
+# Gel codegen, no verify:env, no local Gel instance. auraRN is installed by
+# the caller (its own install.sh needs no secrets).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 # shellcheck source=workspace.sh
 . "$(dirname "$0")/workspace.sh"
 
-HONO="${1:?sibling API checkout path}"
-HONO_BUN="${2:?sibling bun pin}"
+MEGPT="${1:?megpt-mono checkout path}"
+MEGPT_BUN="${2:?megpt-mono bun pin}"
+HONO="$MEGPT/aura-hono-api"
 
 if [[ ! -f "$HONO/package.json" ]]; then
-  echo "[cloud-install] Sibling API checkout missing package.json at $HONO." >&2
+  echo "[cloud-install] megpt-mono checkout missing aura-hono-api/package.json at $HONO." >&2
   exit 1
 fi
 
-echo "[cloud-install] Secretless sibling API deps at $HONO (bun $HONO_BUN). Skipping sibling install.sh."
+echo "[cloud-install] Secretless megpt-mono API deps at $HONO (bun $MEGPT_BUN). Skipping megpt-mono install.sh."
 
 export BUN_INSTALL="${HOME}/.bun"
 export PATH="${BUN_INSTALL}/bin:${PATH}"
-if ! command -v bun >/dev/null 2>&1 || [[ "$(bun --version)" != "$HONO_BUN" ]]; then
-  echo "[cloud-install] Installing Bun v$HONO_BUN for the sibling API pin."
-  curl -fsSL https://bun.sh/install | bash -s "bun-v${HONO_BUN}"
+if ! command -v bun >/dev/null 2>&1 || [[ "$(bun --version)" != "$MEGPT_BUN" ]]; then
+  echo "[cloud-install] Installing Bun v$MEGPT_BUN for the megpt-mono pin."
+  curl -fsSL https://bun.sh/install | bash -s "bun-v${MEGPT_BUN}"
 fi
 if [[ ! -x "${BUN_INSTALL}/bin/bun" ]]; then
   echo "[cloud-install] bun missing at ${BUN_INSTALL}/bin/bun after install." >&2
@@ -49,14 +52,14 @@ if ! command -v redis-server >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server
 fi
 
-echo "[cloud-install] bun install --frozen-lockfile in sibling API root."
+echo "[cloud-install] bun install --frozen-lockfile in megpt-mono/aura-hono-api."
 (
   cd "$HONO"
   bun install --frozen-lockfile
 )
 for sub in tool referral pi-agent; do
   if [[ -f "$HONO/$sub/package.json" ]]; then
-    echo "[cloud-install] bun install --frozen-lockfile in sibling $sub/."
+    echo "[cloud-install] bun install --frozen-lockfile in megpt-mono/aura-hono-api/$sub/."
     (
       cd "$HONO/$sub"
       bun install --frozen-lockfile
@@ -81,4 +84,4 @@ if ! redis-cli ping >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[cloud-install] Secretless sibling API deps done."
+echo "[cloud-install] Secretless megpt-mono API deps done."

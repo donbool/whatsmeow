@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Authintel multi-repo install. Called by install.sh when auraRN and/or
-# aura-hono-api are siblings of this whatsmeow checkout.
+# Authintel multi-repo install. Called by install.sh when megpt-mono is a
+# sibling of this whatsmeow checkout.
 #
 # Idempotent. Delegates to each repo's own install:
-#   auraRN          — Bun 1.3.5 + Swift + bun run verify:env
-#   whatsmeow       — install-go.sh
-#   aura-hono-api   — Bun 1.4.0 + Redis + Greptile + prod Gel/Instant
+#   megpt-mono  — both trees share one Bun pin; root scripts/cloud/install.sh
+#                 runs aura-hono-api then auraRN (prod Gel/Instant secrets).
+#   whatsmeow   — install-go.sh
 #
-# The two Bun pins cannot share one PATH `bun`. auraRN's pin lives in
-# $HOME/.bun-versions/<ver> as bun-<ver>; aura-hono-api's pin is default `bun`.
+# Builds do not inject user-scoped secrets. megpt-mono's install.sh fail-closes
+# without AURADB_EDGEDB_DSN and INSTANT_APP_ADMIN_TOKEN, so when those are
+# missing we bootstrap the monorepo from this repo instead of calling it.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -21,7 +22,7 @@ clone_repo_if_missing() {
   local name="$1"
   local dest
   dest="$(authintel_repo_path "$name")"
-  if [[ -d "$dest/.git" || -f "$dest/package.json" || -f "$dest/go.mod" ]]; then
+  if [[ -d "$dest/.git" || -d "$dest/auraRN" || -f "$dest/package.json" || -f "$dest/go.mod" ]]; then
     echo "[cloud-install] $name already present at $dest."
     return 0
   fi
@@ -31,63 +32,55 @@ clone_repo_if_missing() {
   git clone "$url" "$dest"
 }
 
-# whatsmeow is this checkout; only the other two can be missing.
-clone_repo_if_missing auraRN
-clone_repo_if_missing aura-hono-api
+# whatsmeow is this checkout; only megpt-mono can be missing.
+clone_repo_if_missing megpt-mono
 
+MEGPT="$(authintel_repo_path megpt-mono)"
 AURARN="$(authintel_repo_path auraRN)"
 HONO="$(authintel_repo_path aura-hono-api)"
+
+if [[ ! -d "$AURARN" || ! -d "$HONO" ]]; then
+  echo "[cloud-install] megpt-mono at $MEGPT is missing auraRN/ or aura-hono-api/." >&2
+  exit 1
+fi
 
 AURARN_BUN="$(authintel_read_bun_pin "$AURARN")"
 HONO_BUN="$(authintel_read_bun_pin "$HONO")"
 if [[ -z "$AURARN_BUN" || -z "$HONO_BUN" ]]; then
-  echo "[cloud-install] Could not read packageManager bun pins from auraRN and aura-hono-api." >&2
+  echo "[cloud-install] Could not read packageManager bun pins from megpt-mono trees." >&2
   exit 1
 fi
-echo "[cloud-install] Bun pins: auraRN=$AURARN_BUN aura-hono-api=$HONO_BUN"
+if [[ "$AURARN_BUN" != "$HONO_BUN" ]]; then
+  echo "[cloud-install] Bun pins diverge inside megpt-mono: auraRN=$AURARN_BUN aura-hono-api=$HONO_BUN. The monorepo runs one bun." >&2
+  exit 1
+fi
+MEGPT_BUN="$HONO_BUN"
+echo "[cloud-install] Bun pin: $MEGPT_BUN (both megpt-mono trees)."
 
-# --- auraRN (isolated Bun so hono can own the default `bun` later) -----------
-export BUN_INSTALL="${HOME}/.bun-versions/${AURARN_BUN}"
-export PATH="${BUN_INSTALL}/bin:${PATH}"
-mkdir -p "$BUN_INSTALL"
-echo "[cloud-install] Installing auraRN with BUN_INSTALL=$BUN_INSTALL"
-bash "$AURARN/scripts/cloud/install.sh"
+# --- megpt-mono (shared Bun; backend tree owns ~/.bun) -----------------------
+echo "[cloud-install] Installing megpt-mono at $MEGPT."
+if [[ -n "${AURADB_EDGEDB_DSN:-}" && -n "${INSTANT_APP_ADMIN_TOKEN:-}" ]]; then
+  echo "[cloud-install] Sibling API secrets present in this process; running megpt-mono install.sh."
+  bash "$MEGPT/scripts/cloud/install.sh"
+else
+  echo "[cloud-install] Sibling API secrets not injected into this Build (AURADB_EDGEDB_DSN and/or INSTANT_APP_ADMIN_TOKEN empty). User-scoped secrets are agent-runtime only. Skipping megpt-mono install.sh (it fail-closes) and installing Bun/Redis/lockfile deps plus auraRN from whatsmeow."
+  bash "$WHATSMEOW_ROOT/scripts/cloud/install-sibling-api-deps.sh" "$MEGPT" "$MEGPT_BUN"
+  echo "[cloud-install] Installing megpt-mono/auraRN (no secrets)."
+  env -u AURADB_EDGEDB_DSN -u INSTANT_APP_ADMIN_TOKEN \
+    -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u CURSOR_API_KEY -u GREPTILE_API_KEY \
+    bash "$AURARN/scripts/cloud/install.sh"
+fi
 
 # --- this repo (Go) ----------------------------------------------------------
 echo "[cloud-install] Installing whatsmeow (Go)."
 bash "$WHATSMEOW_ROOT/scripts/cloud/install-go.sh"
 
-# --- aura-hono-api last so its bun + ~/.local/bin persist win the default ----
-# Full sibling install.sh needs AURADB_EDGEDB_DSN and INSTANT_APP_ADMIN_TOKEN.
-# Builds do not inject user-scoped secrets, and that script fail-closes, so
-# when they are missing we run install-sibling-api-deps.sh from this repo
-# instead of calling the sibling install.sh.
-echo "[cloud-install] Installing sibling API repo at $HONO."
-if [[ -n "${AURADB_EDGEDB_DSN:-}" && -n "${INSTANT_APP_ADMIN_TOKEN:-}" ]]; then
-  echo "[cloud-install] Sibling API secrets present in this process; running sibling install.sh."
-  bash "$HONO/scripts/cloud/install.sh"
-else
-  echo "[cloud-install] Sibling API secrets not injected into this Build (AURADB_EDGEDB_DSN and/or INSTANT_APP_ADMIN_TOKEN empty). User-scoped secrets are agent-runtime only. Skipping sibling install.sh (it fail-closes) and installing Bun/Redis/lockfile deps from whatsmeow."
-  bash "$WHATSMEOW_ROOT/scripts/cloud/install-sibling-api-deps.sh" "$HONO" "$HONO_BUN"
-fi
-
-# --- Re-assert versioned bun shims on Cloud's reset PATH ---------------------
-AURARN_BUN_BIN="${HOME}/.bun-versions/${AURARN_BUN}/bin/bun"
-AURARN_BUNX_BIN="${HOME}/.bun-versions/${AURARN_BUN}/bin/bunx"
-if [[ ! -x "$AURARN_BUN_BIN" ]]; then
-  echo "[cloud-install] auraRN bun missing at $AURARN_BUN_BIN after its install." >&2
-  exit 1
-fi
-authintel_persist_onto_cloud_path "$AURARN_BUN_BIN" "bun-${AURARN_BUN}"
-if [[ -e "$AURARN_BUNX_BIN" ]]; then
-  authintel_persist_onto_cloud_path "$AURARN_BUNX_BIN" "bunx-${AURARN_BUN}"
-fi
+# --- Re-assert the shared bun on Cloud's reset PATH --------------------------
 if [[ -x "${HOME}/.bun/bin/bun" ]]; then
-  authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bun" "bun-${HONO_BUN}"
+  authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bun" "bun"
 fi
 if [[ -e "${HOME}/.bun/bin/bunx" ]]; then
   authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bunx" "bunx"
-  authintel_persist_onto_cloud_path "${HOME}/.bun/bin/bunx" "bunx-${HONO_BUN}"
 fi
 
 bash "$WHATSMEOW_ROOT/scripts/cloud/verify-env.sh"

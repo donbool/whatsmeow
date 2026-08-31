@@ -3,8 +3,7 @@
   "install": "bash scripts/cloud/install.sh",
   "start": "bash scripts/cloud/start.sh",
   "repositoryDependencies": [
-    "github.com/Authentic-Intelligence/auraRN",
-    "github.com/clarkg-org/aura-hono-api"
+    "github.com/Authentic-Intelligence/megpt-mono"
   ],
   "ports": [
     { "name": "Hono API", "port": 3000 },

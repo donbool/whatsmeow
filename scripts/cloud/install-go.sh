@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # whatsmeow-only install: Go toolchain pinned by go.mod, then go build/test.
-# Called by install.sh when this checkout has no auraRN/aura-hono-api siblings,
+# Called by install.sh when this checkout has no megpt-mono sibling,
 # and by install-workspace.sh as this repo's step in the multi-repo Build.
 #
 # No secrets. mobile/build-ios.sh is macOS-only and is not run here.

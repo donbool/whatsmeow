@@ -3,7 +3,7 @@
 #
 # This repo is the environment.json home for the authintel multi-repo
 # environment. Cursor runs this from the whatsmeow root:
-#   - Multi-repo (auraRN + aura-hono-api cloned as siblings): full workspace.
+#   - Multi-repo (megpt-mono cloned as a sibling): full workspace.
 #   - This repo alone: Go toolchain + tests only (install-go.sh).
 set -euo pipefail
 
